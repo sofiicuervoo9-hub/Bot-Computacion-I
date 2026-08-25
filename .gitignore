@@ -132,4 +132,4 @@ dmypy.json
 start_dev.sh
 
 # game logs written at the end of each match
-game_*.log
+logs/
