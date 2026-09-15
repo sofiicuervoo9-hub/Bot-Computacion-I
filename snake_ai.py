@@ -1,221 +1,168 @@
-from collections import deque
+"""Estrategia de juego: decide que direccion tomar dado un Board."""
+
 from random import choice
 
-#es un diccionario que me traduce el nombre de la dirección 
-DIRECTIONS = {
-    'up':    (-1, 0),   # fila -1, columna igual  → subís una fila
-    'down':  (1, 0),    # fila +1, columna igual  → bajás una fila
-    'left':  (0, -1),   # fila igual, columna -1  → vas una columna a la izquierda
-    'right': (0, 1),    # fila igual, columna +1  → vas una columna a la derecha
-}
+from board import Board, DIRECTIONS
 
 ENDGAME_SAFETY_BUFFER = 3
 
-# How much extra territory a pure positional move (no food) needs over the
-# best safe food route before we skip guaranteed points for it — small
-# margins aren't worth passing up real food for.
-TERRITORY_OVERRIDE_MARGIN = 3
-
-# opp_dist assumes the opponent takes the perfect shortest path — real
-# opponents rarely do. Only give up on a food race when the opponent's
-# perfect-play edge is bigger than this margin; a 1-2 move "lead" is often
-# not real.
-RACE_CONTEST_MARGIN = 2
-
-def parse_board(board, side):
-    #pasamos de un string con \n y bordes | a una lista limpia de filas
-    rows = [line[1:-1] for line in board.split('\n') if line.startswith('|')]
-    #cada fila-string pasa a ser una lista de caracteres, así se puede indexar grid[r][c]
-    grid = [list(row) for row in rows]
-    #n_rows es directo. n_cols usa el mínimo de todas las filas en vez de asumir que todas miden igual
-    n_rows = len(grid)
-    n_cols = min((len(row) for row in grid), default=0)
-
-    #usa mayúscula para la cabeza y minúscula para el cuerpo de cada lado
-    my_body_char = side.lower() # 'a'
-    opponent = 'B' if side == 'A' else 'A' # 'B'
-    opponent_body = opponent.lower() # 'b'
-
-    head = None
-    food = []
-    opponent_head = None
-    opponent_blocked = set()
-    for r in range(n_rows):
-        for c in range(n_cols):
-            ch = grid[r][c]
-            if ch == '*': # comida
-                food.append((r, c))
-            elif ch == side: # cabeza
-                head = (r, c)
-            elif ch == opponent: #cabeza del rival
-                opponent_head = (r, c)
-                opponent_blocked.add((r, c))
-            elif ch == opponent_body: #cuerpo del rival 
-                opponent_blocked.add((r, c))
-    return grid, n_rows, n_cols, head, food, opponent_blocked, opponent_head, my_body_char
+# Margen de puntaje a partir del cual se activa el "modo cazador": con
+# una ventaja mayor a esto, en vez de solo posicionarse de forma
+# defensiva, se prioriza achicarle el espacio disponible al rival.
+# En 0: cualquier ventaja (incluso minima) activa el modo cazador.
+AGGRESSIVE_MARGIN = 0
 
 
-def trace_body(head, my_body_char, grid, n_rows, n_cols):
-    #quiero saber cual es la cola(la ultima), porque esa se libera el próximo turno si no como 
-    if head is None:
-        return []
-    body = [head]
-    visited = {head} #evita volver a pisar una celda ya visitada
-    current = head
-    while True:
-        nxt = None
-        for _, npos in neighbors(current, n_rows, n_cols):
-            nr, nc = npos
-            if npos not in visited and grid[nr][nc] == my_body_char:
-                nxt = npos
-                break
-        if nxt is None:
-            break
-        body.append(nxt)
-        visited.add(nxt)
-        current = nxt
-    return body
+class SnakeStrategy:
+    """Encapsula la logica de decision (antes era la funcion choose_direction).
 
-def neighbors(pos, n_rows, n_cols): #recibe una posicion y devuelve las posiciones válidas de sus vecinos
-    r, c = pos #desempaqueto fila y columna 
-    for dname, (dr, dc) in DIRECTIONS.items():
-        nr, nc = r + dr, c + dc #calculo el desplazamiento 
-        if 0 <= nr < n_rows and 0 <= nc < n_cols: #revisa que el vecino candidado si exista en el tablero
-            yield dname, (nr, nc)
+    No guarda estado de una partida a la otra: cada llamada a
+    choose_direction reconstruye el Board a partir de lo que llego en
+    ese turno, asi que funciona igual sin importar el tamano del
+    tablero de cada partida.
+    """
 
-def manhattan(a, b): #calcula la distancia entre dos puntos en la grilla 
-    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+    def __init__(self, safety_buffer=ENDGAME_SAFETY_BUFFER, aggressive_margin=AGGRESSIVE_MARGIN):
+        self.safety_buffer_value = safety_buffer
+        self.aggressive_margin = aggressive_margin
+        self._opp_dist = {}
 
+    def choose_direction(self, board_str, side, board_size=None, next_digit=None,
+                          my_score=None, opp_score=None, remaining_moves=None):
+        try:
+            board = Board(board_str, side, board_size, next_digit)
+        except Exception:
+            return choice(list(DIRECTIONS.keys()))
 
-def bfs_all_distances(start, blocked, n_rows, n_cols): #Breadth-First Search / búsqueda por anchura
-    #a partir de start calcula la distancia minima a todas la celdas alcanzables, esquivando las que están blocked
-    if start is None or start in blocked:
-        return {}
-    dist = {start: 0} #resultado final 
-    queue = deque([start]) #cola FIFO 
-    while queue:
-        pos = queue.popleft()
-        d = dist[pos]
-        for _, npos in neighbors(pos, n_rows, n_cols):
-            if npos not in blocked and npos not in dist:
-                dist[npos] = d + 1
-                queue.append(npos)
-    return dist
+        if board.head is None:
+            return choice(list(DIRECTIONS.keys()))
 
+        candidates = self._build_candidates(board)
+        if not candidates:
+            # No hay movimiento seguro: vamos a chocar igual, elegimos algo.
+            return choice(list(DIRECTIONS.keys()))
 
-def choose_direction(board, side, my_score=None, opp_score=None, remaining_moves=None):
-    grid, n_rows, n_cols, head, food, opponent_blocked, opponent_head, my_body_char = \
-        parse_board(board, side)
-    if head is None:
-        return choice(list(DIRECTIONS.keys()))
+        safety_buffer = self._safety_buffer(board, my_score, opp_score, remaining_moves)
 
-    body_cells = {
-        (r, c)
-        for r in range(n_rows) for c in range(n_cols)
-        if grid[r][c] == side or grid[r][c] == my_body_char
-    }
-    body_len = len(body_cells)
+        step = self._best_food_move(board, candidates, safety_buffer)
+        if step is not None:
+            return step
 
-    ordered_body = trace_body(head, my_body_char, grid, n_rows, n_cols)
-    tail = ordered_body[-1] if len(ordered_body) == body_len else None
+        aggressive = self._is_aggressive(my_score, opp_score)
+        return self._best_territory_move(board, candidates, aggressive)
 
-    food_set = set(food)
+    # -- pasos internos --------------------------------------------------
 
-    opponent_static_blocked = body_cells | (opponent_blocked - {opponent_head})
-    opp_dist = bfs_all_distances(opponent_head, opponent_static_blocked, n_rows, n_cols)
+    def _safety_buffer(self, board, my_score, opp_score, remaining_moves):
+        if my_score is not None and opp_score is not None and my_score > opp_score:
+            if remaining_moves is not None and remaining_moves <= max(10, len(board.body_cells)):
+                return self.safety_buffer_value
+        return 0
 
-    candidates = {}
-    for dname, pos in neighbors(head, n_rows, n_cols):
-        if pos in opponent_blocked or pos in body_cells:
-            continue
-        ate = pos in food_set
-        if ate:
-            new_body_len = body_len + 1
-            my_cells_after = body_cells
-        else:
-            new_body_len = body_len
-            my_cells_after = body_cells - {tail} if tail is not None else body_cells
-        # pos deliberately stays OUT of new_blocked: it's the start of the
-        # BFS right below, and bfs_all_distances treats a blocked start as
-        # unreachable (returns {} immediately) — pos can't be its own wall.
-        new_blocked = my_cells_after | opponent_blocked
-        dist_map = bfs_all_distances(pos, new_blocked, n_rows, n_cols)
-        space = len(dist_map)
-        territory = sum(
-            1 for cell, d in dist_map.items()
-            if opp_dist.get(cell) is None or (d + 1) < opp_dist[cell]
-        )
-        candidates[dname] = {
-            'dir': dname, 'pos': pos, 'space': space, 'dist_map': dist_map,
-            'body_len': new_body_len, 'territory': territory,
-        }
+    def _is_aggressive(self, my_score, opp_score):
+        # "Modo cazador": voy ganando por mas del margen configurado, asi
+        # que en vez de solo posicionarme defensivamente, priorizo
+        # achicarle las opciones al rival.
+        if my_score is None or opp_score is None:
+            return False
+        return my_score > opp_score + self.aggressive_margin
 
-    if not candidates:
-        # No safe move: we're going to crash regardless, just pick something.
-        return choice(list(DIRECTIONS.keys()))
+    def _build_candidates(self, board):
+        opponent_own_blocked = board.opponent_blocked - {board.opponent_head}
+        opponent_static_blocked = board.body_cells | opponent_own_blocked
+        self._opp_dist = board.bfs_all_distances(board.opponent_head, opponent_static_blocked)
 
-    safety_buffer = 0
-    if my_score is not None and opp_score is not None and my_score > opp_score:
-        if remaining_moves is not None and remaining_moves <= max(10, body_len):
-            safety_buffer = ENDGAME_SAFETY_BUFFER
-
-    food_targets = []
-    for target in food_set:
-        best_step, best_dist = None, None
-        for cand in candidates.values():
-            d = cand['dist_map'].get(target)
-            if d is None:
+        food_set = set(board.food)
+        candidates = {}
+        for dname, pos in board.neighbors(board.head):
+            if pos in board.opponent_blocked or pos in board.body_cells:
                 continue
-            total = d + 1
-            if best_dist is None or total < best_dist:
-                best_dist, best_step = total, cand['dir']
-        if best_step is not None:
-            food_targets.append((best_dist, best_step, target))
+            ate = pos in food_set
+            if ate:
+                new_body_len = len(board.body_cells) + 1
+                new_blocked = board.body_cells | board.opponent_blocked
+            else:
+                new_body_len = len(board.body_cells)
+                base = board.body_cells - {board.tail} if board.tail is not None else board.body_cells
+                new_blocked = base | board.opponent_blocked
+            dist_map = board.bfs_all_distances(pos, new_blocked)
+            space = len(dist_map)
+            territory = sum(
+                1 for cell, d in dist_map.items()
+                if self._opp_dist.get(cell) is None or (d + 1) < self._opp_dist[cell]
+            )
+            # Cuanto espacio le quedaria al rival si yo tomo este paso: mi
+            # nuevo cuerpo (incluida esta celda) pasa a bloquearlo a el
+            # tambien. Sirve para el modo cazador: preferir movimientos
+            # que le achican las opciones, no solo los que me convienen
+            # a mi. new_blocked ya incluye a board.opponent_blocked (que
+            # trae su propia cabeza adentro) -- hay que sacarla o el BFS
+            # arranca "bloqueado" y siempre da 0.
+            opp_blocked_after = (opponent_own_blocked | new_blocked | {pos}) - {board.opponent_head}
+            opp_space = len(board.bfs_all_distances(board.opponent_head, opp_blocked_after))
+            candidates[dname] = {
+                'dir': dname, 'pos': pos, 'space': space, 'dist_map': dist_map,
+                'body_len': new_body_len, 'territory': territory, 'opp_space': opp_space,
+                # v3: pisar un digito que no es el objetivo no mata, pero
+                # cuesta -500 -- se evita salvo que no haya alternativa.
+                'wrong_digit': pos in board.wrong_digit_positions,
+            }
+        return candidates
 
-    # Every food route that's actually safe and that we'd reach before the
-    # opponent, ranked by distance first and territory only as a tiebreak.
-    # Territory-first used to win outright even when it meant a much longer
-    # detour for a farther piece of food — measured against a rival that
-    # always beelines for the nearest food, that alone cost us the score
-    # race (avg gap ~8-9 points across 25 seeds) for a small territory gain
-    # (~52% vs ~49% of the board). Distance-first ties the score on average
-    # while territory barely drops — the TERRITORY_OVERRIDE_MARGIN check
-    # below still lets us skip food entirely for a big territory swing, so
-    # aggressive space-claiming isn't gone, just no longer the default.
-    viable_food_moves = []
-    for my_d, step, target in food_targets:
-        opp_d = opp_dist.get(target)
-        if opp_d is not None and opp_d + RACE_CONTEST_MARGIN < my_d:
-            continue
-        cand = candidates[step]
-        if cand['space'] >= cand['body_len'] + safety_buffer:
-            viable_food_moves.append((my_d, cand['territory'], step))
-    viable_food_moves.sort(key=lambda t: (t[0], -t[1]))
+    def _best_food_move(self, board, candidates, safety_buffer):
+        food_targets = []
+        for target in set(board.food):
+            best_step, best_key = None, None
+            for cand in candidates.values():
+                d = cand['dist_map'].get(target)
+                if d is None:
+                    continue
+                total = d + 1
+                # A igual distancia, se prefiere el paso que no pisa un
+                # digito equivocado en el camino.
+                key = (total, cand['wrong_digit'])
+                if best_key is None or key < best_key:
+                    best_key, best_step = key, cand['dir']
+            if best_step is not None:
+                food_targets.append((best_key[0], best_step, target))
+        food_targets.sort(key=lambda t: t[0])
 
-    tail_for_rank = tail if tail is not None else head
-    safe = [c for c in candidates.values() if c['space'] >= c['body_len']]
-    pool = safe or list(candidates.values())
+        for my_d, step, target in food_targets:
+            opp_d = self._opp_dist.get(target)
+            if opp_d is not None and opp_d < my_d:
+                continue
+            cand = candidates[step]
+            if cand['space'] >= cand['body_len'] + safety_buffer:
+                return step
+        return None
 
-    def rank(cand):
-        dist_to_opp = manhattan(cand['pos'], opponent_head) if opponent_head else 0
-        dist_to_tail = manhattan(cand['pos'], tail_for_rank)
-        return (-cand['territory'], -dist_to_opp, dist_to_tail)
+    def _best_territory_move(self, board, candidates, aggressive=False):
+        tail_for_rank = board.tail if board.tail is not None else board.head
+        safe = [c for c in candidates.values() if c['space'] >= c['body_len']]
+        pool = safe or list(candidates.values())
 
-    positional_best = min(pool, key=rank)
+        def rank(cand):
+            dist_to_opp = board.manhattan(cand['pos'], board.opponent_head) if board.opponent_head else 0
+            dist_to_tail = board.manhattan(cand['pos'], tail_for_rank)
+            # wrong_digit va primero en la tupla: False (0) ordena antes
+            # que True (1), asi que se elige de ultima opcion.
+            if aggressive:
+                # Modo cazador: antes que maximizar mi propio territorio,
+                # prefiero el paso que mas le achica el espacio al rival.
+                return (cand['wrong_digit'], cand['opp_space'], -cand['territory'], -dist_to_opp, dist_to_tail)
+            return (cand['wrong_digit'], -cand['territory'], -dist_to_opp, dist_to_tail)
 
-    if viable_food_moves:
-        _, best_food_territory, best_food_step = viable_food_moves[0]
-        # Only skip safe, winnable food for pure positioning when there's an
-        # actual opponent to contest space against, and the territory gain
-        # is big enough to be worth passing up real points for. The margin
-        # scales with how much territory is already at stake — a flat cell
-        # count is meaningless on a 20x20 board vs an 8x8 one.
-        override_margin = max(TERRITORY_OVERRIDE_MARGIN, body_len, best_food_territory)
-        if (
-            opponent_head is not None
-            and positional_best['territory'] > best_food_territory + override_margin
-        ):
-            return positional_best['dir']
-        return best_food_step
+        best = min(pool, key=rank)
+        return best['dir']
 
-    return positional_best['dir']
+
+# Wrapper funcional para compatibilidad con codigo/tests que todavia
+# llaman choose_direction(board, side, ...) directamente.
+_default_strategy = SnakeStrategy()
+
+
+def choose_direction(board, side, my_score=None, opp_score=None, remaining_moves=None,
+                      board_size=None, next_digit=None):
+    return _default_strategy.choose_direction(
+        board, side, board_size, next_digit, my_score, opp_score, remaining_moves
+    )
