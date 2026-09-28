@@ -17,6 +17,43 @@ es el unico digito cuyo predecesor ciclico NO esta en tablero (eso
 marca el inicio de la racha). Comer el digito correcto sale digito x
 100 puntos; comer cualquier otro sale -500 (no mata, pero conviene
 evitarlo).
+
+Desde el 16/9/2026 (v4) tambien hay pickups 'X' en el tablero: comer
+uno da +50 fijo y suma un escalon permanente al multiplicador de
+puntaje (x2, x3, ...) que de ahi en mas multiplica los puntos de
+comida (no el +50 del propio X, ni el +1 por movimiento, ni las
+penalidades). No hacen crecer la vibora -- a diferencia de un digito,
+pisar un X se comporta como un movimiento normal en cuanto a cuerpo/
+cola. El multiplicador en si (``multiplier_1``/``multiplier_2``) no
+se puede leer del tablero -- lo manda aparte turn_data.
+
+Desde el 23/9/2026 (v5) hay un muro '#' en el tablero: una unica
+linea recta (horizontal o vertical) de largo impar de hasta 11
+celdas, ubicada al azar sobre celdas vacias. Despues de que ambos
+jugadores se mueven, se achica un casillero de cada punta (11->9->7->
+...->1->desaparece); al desaparecer aparece uno nuevo en otro lado.
+Como Board se reconstruye desde cero en cada turno a partir del
+board_str que manda el servidor, no hace falta modelar el
+achicamiento nosotros: alcanza con leer que celdas son '#' en el
+tablero de ESE turno, y el achicamiento se refleja solo turno a
+turno. Chocar contra el muro no mata (a diferencia de chocar contra
+un cuerpo) pero cuesta -500 y la vibora no se mueve ese turno -- por
+eso las celdas de muro se tratan como bloqueadas para el pathfinding
+(nadie puede entrar ahi este turno) pero, a diferencia de
+body_cells/opponent_blocked, no se descartan como direccion
+candidata: siguen siendo una salida valida (aunque carisima) si no
+queda otra alternativa que morir.
+
+Desde el 30/9/2026 (v6) cada uno de los cinco digitos de la ventana
+aparece en varias copias (entre 3 y 5) en vez de una sola celda. La
+regla de orden no cambia, pero comer UNA copia del digito objetivo
+borra todas las demas copias de ese digito (y el siguiente aparece en
+sus propias 3-5 copias). Por eso ``food`` pasa a tener TODAS las
+copias del objetivo -- cualquiera sirve, conviene ir a la mas cercana
+-- y ``wrong_digit_positions`` todas las copias de los otros digitos
+(comer una sigue costando -500). ``target_digit_pos`` se mantiene por
+compatibilidad (primera copia encontrada); la lista completa esta en
+``target_digit_positions``.
 """
 
 from collections import deque
@@ -50,6 +87,8 @@ class Board:
         self.opponent_head = None
         self.food = []
         self.digit_values = {}
+        self.multiplier_pickups = []
+        self.wall_cells = set()
         self.opponent_blocked = set()
         self.body_cells = set()
         self._scan_cells()
@@ -60,6 +99,7 @@ class Board:
         # lo inferimos del tablero como respaldo.
         self.target_digit = None
         self.target_digit_pos = None
+        self.target_digit_positions = []
         self.wrong_digit_positions = set()
         if self.digit_values:
             if next_digit is not None:
@@ -69,12 +109,14 @@ class Board:
                     self.target_digit = None
             if self.target_digit is None:
                 self.target_digit = self._infer_target_digit()
-            self.target_digit_pos = self._locate_digit(self.target_digit)
-            if self.target_digit_pos is not None:
-                self.food = [self.target_digit_pos]
-            self.wrong_digit_positions = set(self.digit_values) - (
-                {self.target_digit_pos} if self.target_digit_pos is not None else set()
+            # v6: el objetivo puede tener varias copias; todas son
+            # comida valida (comer cualquiera borra el resto).
+            self.target_digit_positions = self._locate_all_digits(self.target_digit)
+            self.target_digit_pos = (
+                self.target_digit_positions[0] if self.target_digit_positions else None
             )
+            self.food = list(self.target_digit_positions)
+            self.wrong_digit_positions = set(self.digit_values) - set(self.target_digit_positions)
 
         self.ordered_body = self._trace_body()
         self.tail = (
@@ -119,6 +161,10 @@ class Board:
                     continue
                 if ch == '*':
                     self.food.append((r, c))
+                elif ch == 'X':
+                    self.multiplier_pickups.append((r, c))
+                elif ch == '#':
+                    self.wall_cells.add((r, c))
                 elif ch.isdigit() and ch != '0':
                     self.digit_values[(r, c)] = int(ch)
                 elif ch == self.side:
@@ -148,12 +194,15 @@ class Board:
         )
 
     def _locate_digit(self, value):
+        """Primera copia de `value` (compatibilidad pre-v6)."""
+        positions = self._locate_all_digits(value)
+        return positions[0] if positions else None
+
+    def _locate_all_digits(self, value):
+        """v6: todas las copias de `value` en tablero (en orden de lectura)."""
         if value is None:
-            return None
-        for pos, v in self.digit_values.items():
-            if v == value:
-                return pos
-        return None
+            return []
+        return [pos for pos, v in self.digit_values.items() if v == value]
 
     def _trace_body(self):
         # Recorre el cuerpo desde la cabeza para saber cual celda es la

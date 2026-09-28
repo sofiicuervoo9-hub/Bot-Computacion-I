@@ -205,3 +205,103 @@ def test_side_b_invierte_cabeza_cuerpo_propio_y_rival():
     b = Board(board_str, 'B')
     assert b.head == (3, 4)
     assert b.opponent_head == (1, 3)
+
+
+# -- v4: pickups de multiplicador ('X') --------------------------------
+
+def test_detecta_pickups_de_multiplicador():
+    board_str = make_board_str([
+        '.......',
+        '.A..X..',
+        '.......',
+        '..X....',
+    ])
+    b = Board(board_str, 'A')
+    assert set(b.multiplier_pickups) == {(1, 4), (3, 2)}
+
+
+def test_pickup_no_se_confunde_con_digito_ni_bloquea():
+    # Un 'X' junto a los digitos v3: no debe terminar ni en digit_values
+    # ni en wrong_digit_positions, y sigue siendo una celda transitable
+    # (no aparece en body_cells ni en opponent_blocked).
+    board_str = make_board_str(['.1...', 'A..2.', '.X.3.', '4....', '....5'])
+    b = Board(board_str, 'A')
+    assert (2, 1) in b.multiplier_pickups
+    assert (2, 1) not in b.digit_values
+    assert (2, 1) not in b.wrong_digit_positions
+    assert (2, 1) not in b.body_cells
+    assert (2, 1) not in b.opponent_blocked
+
+
+def test_sin_pickups_lista_vacia():
+    board_str = make_board_str(['.....', '.A*..'])
+    b = Board(board_str, 'A')
+    assert b.multiplier_pickups == []
+
+
+# -- v5: muro ('#') ----------------------------------------------------
+
+def test_detecta_celdas_de_muro():
+    board_str = make_board_str([
+        '.......',
+        '.A..#..',
+        '.......',
+        '..#....',
+        '..#....',
+    ])
+    b = Board(board_str, 'A')
+    assert b.wall_cells == {(1, 4), (3, 2), (4, 2)}
+
+
+def test_muro_no_se_confunde_con_otras_celdas():
+    # Una celda de muro junto a digitos v3 y un pickup v4: no debe
+    # terminar en digit_values, wrong_digit_positions, multiplier_pickups,
+    # body_cells ni opponent_blocked -- sigue siendo transitable a nivel
+    # de deteccion (el bloqueo se maneja aparte, en snake_ai).
+    board_str = make_board_str(['.1...', 'A..2.', '.#.3.', '4.X..', '....5'])
+    b = Board(board_str, 'A')
+    assert (2, 1) in b.wall_cells
+    assert (2, 1) not in b.digit_values
+    assert (2, 1) not in b.wrong_digit_positions
+    assert (2, 1) not in b.multiplier_pickups
+    assert (2, 1) not in b.body_cells
+    assert (2, 1) not in b.opponent_blocked
+
+
+# -- v6: copias multiples de cada digito ---------------------------------
+
+def test_v6_todas_las_copias_del_objetivo_son_comida():
+    board_str = make_board_str([
+        '3....4',
+        '..A...',
+        '5..3..',
+        '......',
+        '6....3',
+        '7..4..',
+    ])
+    b = Board(board_str, 'A', next_digit=3)
+    assert b.target_digit_positions == [(0, 0), (2, 3), (4, 5)]
+    assert set(b.food) == {(0, 0), (2, 3), (4, 5)}
+    assert b.target_digit_pos == (0, 0)  # compatibilidad: primera en orden de lectura
+    # Ninguna copia del objetivo es "equivocada"; todas las de los otros si.
+    assert b.wrong_digit_positions == {(0, 5), (2, 0), (4, 0), (5, 0), (5, 3)}
+
+
+def test_v6_inferencia_del_objetivo_con_copias_repetidas():
+    # Sin next_digit: la inferencia usa el conjunto de valores, asi que
+    # las copias repetidas no la confunden.
+    board_str = make_board_str(['4.5.6.', 'A.4.8.', '5.7.6.', '8.7.4.'])
+    b = Board(board_str, 'A')
+    assert b.target_digit == 4
+    assert len(b.target_digit_positions) == 3
+
+
+def test_locate_all_digits_con_none_devuelve_lista_vacia():
+    b = Board(make_board_str(['.1...']), 'A')
+    assert b._locate_all_digits(None) == []
+
+
+def test_sin_muro_lista_vacia():
+    board_str = make_board_str(['.....', '.A*..'])
+    b = Board(board_str, 'A')
+    assert b.wall_cells == set()

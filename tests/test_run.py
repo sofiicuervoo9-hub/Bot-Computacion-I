@@ -4,6 +4,7 @@ mockeado -- no abren conexion de red real."""
 import json
 import sys
 import time
+from datetime import datetime
 
 import pytest
 import websockets
@@ -32,6 +33,20 @@ def test_game_logger_write_crea_archivo_y_limpia_historial(tmp_path, monkeypatch
     assert log_file.exists()
     assert 'game_over' in log_file.read_text()
     assert 'g2' not in logger._history
+
+
+def test_log_event_y_log_action_incluyen_timestamp_parseable():
+    logger = GameLogger()
+    logger.log_event('g1b', {'event': 'x'})
+    logger.log_action('g1b', {'action': 'move', 'data': {'direction': 'up'}})
+
+    for line, marker in zip(logger._history['g1b'], ['< [', '> [']):
+        assert line.startswith(marker)
+        closing = line.index(']')
+        timestamp_str = line[len(marker):closing]  # arranca justo despues del '['
+        datetime.fromisoformat(timestamp_str)  # no debe tirar excepcion
+        json_part = line[line.index('{'):]
+        json.loads(json_part)  # el JSON sigue siendo parseable igual
 
 
 def test_game_logger_write_sin_historial_previo(tmp_path, monkeypatch):
@@ -235,6 +250,58 @@ async def test_process_turn_next_digit_se_pasa_a_la_estrategia():
     await bot._process_turn(ws, {'data': data})
     args = strategy.calls[0][0]
     assert args[3] == 7  # next_digit
+
+
+@pytest.mark.asyncio
+async def test_process_turn_side_a_usa_multiplier_1_como_mio():
+    strategy = FakeStrategy(direction='down')
+    bot = make_bot(strategy)
+    ws = FakeWebSocket()
+    data = {
+        'side': 'A', 'board': '|...|', 'board_size': '1x3',
+        'game_id': 'g6b', 'turn_token': 't1',
+        'score_1': 10, 'score_2': 4, 'remaining_moves': 20,
+        'multiplier_1': 3, 'multiplier_2': 1,
+    }
+    await bot._process_turn(ws, {'data': data})
+    args = strategy.calls[0][0]
+    assert args[7] == 3  # my_multiplier
+    assert args[8] == 1  # opp_multiplier
+
+
+@pytest.mark.asyncio
+async def test_process_turn_side_b_usa_multiplier_2_como_mio():
+    strategy = FakeStrategy(direction='down')
+    bot = make_bot(strategy)
+    ws = FakeWebSocket()
+    data = {
+        'side': 'B', 'board': '|...|', 'board_size': '1x3',
+        'game_id': 'g7b', 'turn_token': 't1',
+        'score_1': 10, 'score_2': 4, 'remaining_moves': 20,
+        'multiplier_1': 3, 'multiplier_2': 1,
+    }
+    await bot._process_turn(ws, {'data': data})
+    args = strategy.calls[0][0]
+    assert args[7] == 1  # my_multiplier (soy side B -> multiplier_2)
+    assert args[8] == 3  # opp_multiplier
+
+
+@pytest.mark.asyncio
+async def test_process_turn_sin_multiplicador_pasa_none():
+    # Partidas anteriores al 16/9/2026 no traen multiplier_1/2 -- no
+    # debe romper, simplemente se pasa None.
+    strategy = FakeStrategy(direction='down')
+    bot = make_bot(strategy)
+    ws = FakeWebSocket()
+    data = {
+        'side': 'A', 'board': '|...|', 'board_size': '1x3',
+        'game_id': 'g6c', 'turn_token': 't1',
+        'score_1': 0, 'score_2': 0, 'remaining_moves': 20,
+    }
+    await bot._process_turn(ws, {'data': data})
+    args = strategy.calls[0][0]
+    assert args[7] is None
+    assert args[8] is None
 
 
 @pytest.mark.asyncio

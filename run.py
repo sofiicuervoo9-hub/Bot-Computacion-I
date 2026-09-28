@@ -7,6 +7,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from datetime import datetime
 from random import choice
 
 import websockets
@@ -17,16 +18,34 @@ from snake_ai import SnakeStrategy
 
 class GameLogger:
     """Guarda el historial (recibido/enviado) de cada partida y lo
-    vuelca a game_<id>.log cuando termina."""
+    vuelca a game_<id>.log cuando termina.
+
+    Cada linea lleva un timestamp (hora local, con milisegundos) entre
+    corchetes despues de la marca '< '/'> ' -- sirve para diferenciar,
+    por ejemplo, una partida cortada por un limite de tiempo real del
+    torneo de una cortada por otro motivo, cosa que antes no se podia
+    ver en el log. El '< '/'> ' se mantiene como los primeros dos
+    caracteres de la linea (compatibilidad con quien ya parsea por
+    eso); para el JSON en si conviene ubicarlo por la primera '{' de la
+    linea en vez de una posicion fija, asi sirve tanto para logs viejos
+    (sin timestamp) como para estos."""
 
     def __init__(self):
         self._history = {}
 
+    @staticmethod
+    def _timestamp():
+        return datetime.now().isoformat(sep=' ', timespec='milliseconds')
+
     def log_event(self, game_id, message):
-        self._history.setdefault(game_id, []).append('< ' + json.dumps(message))
+        self._history.setdefault(game_id, []).append(
+            f"< [{self._timestamp()}] " + json.dumps(message)
+        )
 
     def log_action(self, game_id, message):
-        self._history.setdefault(game_id, []).append('> ' + json.dumps(message))
+        self._history.setdefault(game_id, []).append(
+            f"> [{self._timestamp()}] " + json.dumps(message)
+        )
 
     def write(self, game_id):
         try:
@@ -124,15 +143,18 @@ class SnakeBot:
 
         if side == 'A':
             my_score, opp_score = data.get('score_1'), data.get('score_2')
+            my_multiplier, opp_multiplier = data.get('multiplier_1'), data.get('multiplier_2')
         else:
             my_score, opp_score = data.get('score_2'), data.get('score_1')
+            my_multiplier, opp_multiplier = data.get('multiplier_2'), data.get('multiplier_1')
         remaining_moves = data.get('remaining_moves')
 
         print(board_str)
         start = time.perf_counter()
         try:
             direction = self._choose_direction_con_limite(
-                board_str, side, board_size, next_digit, my_score, opp_score, remaining_moves
+                board_str, side, board_size, next_digit, my_score, opp_score, remaining_moves,
+                my_multiplier, opp_multiplier,
             )
         except Exception:
             # Si hay un bug en la estrategia, elegimos una direccion al azar
