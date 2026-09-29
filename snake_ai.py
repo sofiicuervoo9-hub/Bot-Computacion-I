@@ -24,6 +24,28 @@ AGGRESSIVE_MARGIN = 0
 # otra alternativa segura hacia el objetivo.
 WRONG_DIGIT_STEP_PENALTY = 1000
 
+# v4: parametros para decidir entre el digito y un 'X' (ver _x_primero).
+# Turnos propios que se asumen si no llega remaining_moves.
+X_DEFAULT_TURNS = 150
+# Minimo de pasos que se estiman entre un digito y el siguiente.
+X_MIN_STEPS_PER_DIGIT = 5
+# Cuantos digitos hacia adelante se prueban para ir a esperar cuando el
+# rival gana la carrera por el objetivo actual.
+NEXT_DIGITS_AHEAD = 3
+# Si mi multiplicador esta por debajo del rival, mientras espero al
+# siguiente digito acepto un desvio a un 'X' aunque el calculo diga que
+# el rival llega hasta estos pasos antes (el calculo supone que el rival
+# va derecho, y casi nunca lo hace). Ver partida my_match 7.
+X_CATCHUP_TOLERANCE = 3
+
+# Carrera por el digito objetivo: el calculo supone que el rival va
+# derecho, pero muchas veces se desvia (por ejemplo, a juntar 'X'). Por
+# cada turno mio en que el rival NO se acerco al objetivo, se le suman
+# estos pasos a su distancia (hasta RACE_STALL_MAX turnos). Cuando se
+# vuelve a acercar, se descuenta de a un turno. Ver partida my_match 9.
+RACE_STALL_BONUS = 2
+RACE_STALL_MAX = 10
+
 
 class SnakeStrategy:
     """Encapsula la logica de decision (antes era la funcion choose_direction).
@@ -38,6 +60,13 @@ class SnakeStrategy:
         self.safety_buffer_value = safety_buffer
         self.aggressive_margin = aggressive_margin
         self._opp_dist = {}
+        # Seguimiento de la carrera por el digito objetivo (ver
+        # _update_race). Es el unico estado entre turnos: se reinicia
+        # solo cuando cambia el objetivo o sus posiciones.
+        self._race_key = None
+        self._race_last = None
+        self._race_stall = 0
+        self._food_bonus = 0
 
     def choose_direction(self, board_str, side, board_size=None, next_digit=None,
                           my_score=None, opp_score=None, remaining_moves=None,
@@ -51,33 +80,217 @@ class SnakeStrategy:
             return choice(list(DIRECTIONS.keys()))
 
         candidates = self._build_candidates(board)
+        self._update_race(board)
         if not candidates:
             # No hay movimiento seguro: vamos a chocar igual, elegimos algo.
             return choice(list(DIRECTIONS.keys()))
 
         safety_buffer = self._safety_buffer(board, my_score, opp_score, remaining_moves)
 
-        # El digito correcto y un pickup 'X' compiten por distancia, no
-        # por una prioridad fija: como casi siempre hay un digito
-        # alcanzable (hay 5 en tablero todo el tiempo), darle prioridad
-        # fija al digito significa que el bot practicamente nunca se
-        # desvia a buscar un 'X' -- y el multiplicador que da es
-        # permanente, se acumula sobre TODOS los digitos que comamos
-        # despues. Por eso: si el 'X' esta mas cerca (o igual de cerca)
-        # que el digito, conviene ir por el primero.
-        food_step, food_dist = self._best_target_move(candidates, board.food, safety_buffer)
+        # v4: el digito y el 'X' se comparan por PUNTOS, no por distancia
+        # (ver _x_primero). Un digito vale digito x 100 x multiplicador; el
+        # 'X' vale +50 y un escalon mas de multiplicador para el resto de
+        # la partida, asi que conviene mas cuanto mas partida queda.
+        food_step, food_dist = self._best_target_move(candidates, board.food, safety_buffer,
+                                                      opp_bonus=self._food_bonus)
         mult_step, mult_dist = self._best_target_move(candidates, board.multiplier_pickups, safety_buffer)
 
         if food_step is not None and mult_step is not None:
-            step = mult_step if mult_dist <= food_dist else food_step
-            return step
+            # Ademas de convenir en puntos, el 'X' tiene que dejarme llegar
+            # al digito antes que el rival. Si no, el bot encadena un 'X'
+            # tras otro y nunca come (partida my_match 6).
+            if (self._x_primero(board, food_dist, mult_dist, my_multiplier, remaining_moves)
+                    and self._x_no_me_hace_perder(
+                        board, candidates, board.food,
+                        self._opp_time_to(board.food, self._food_bonus))):
+                return mult_step
+            return food_step
         if food_step is not None:
             return food_step
+
+        # El digito objetivo no esta disponible (el rival llega antes, o
+        # no hay camino). En vez de ir a juntar 'X' y quedar lejos de
+        # todo, conviene esperar al lado del SIGUIENTE digito del orden:
+        # cuando el rival se coma el actual, ese pasa a ser el objetivo y
+        # quedamos pegados (ver _plan_siguiente_digito).
+        next_step = self._plan_siguiente_digito(board, candidates, safety_buffer, mult_step,
+                                                my_multiplier, opp_multiplier)
+        if next_step is not None:
+            return next_step
         if mult_step is not None:
             return mult_step
 
         aggressive = self._is_aggressive(my_score, opp_score, board)
         return self._best_territory_move(board, candidates, aggressive)
+
+    # -- v4: digito o 'X' --------------------------------------------------
+
+    @staticmethod
+    def _my_turns_left(remaining_moves):
+        """remaining_moves cuenta los movimientos de LOS DOS jugadores (en
+        el log de ejemplo baja de 300 a 298 entre dos turnos mios), asi
+        que los turnos propios que quedan, incluido este, son la mitad."""
+        if remaining_moves is None:
+            return X_DEFAULT_TURNS
+        return (remaining_moves + 1) // 2
+
+    def _x_primero(self, board, food_dist, x_dist, my_multiplier, remaining_moves):
+        """Compara dos planes y devuelve True si conviene ir primero al 'X':
+
+        A) digito y despues X:  digito x100 x m      + 50 + ingreso(resto)
+        B) X y despues digito:  50 + digito x100 x (m+1) + ingreso(resto)
+
+        "ingreso" son los puntos de los digitos que vendrian despues, ya
+        con multiplicador m+1 en los dos planes. Solo cuenta lo que se
+        alcanza antes de que termine la partida, por eso al final el 'X'
+        tiende a valer solo +50.
+        """
+        m = my_multiplier or 1
+        digit = board.target_digit or 1
+        turns = self._my_turns_left(remaining_moves)
+        # Distancia entre los dos objetivos: cota superior pasando por la
+        # cabeza (no sabemos cual copia/cual X eligio _best_target_move).
+        between = food_dist + x_dist
+
+        digits = list(board.digit_values.values())
+        avg_digit = sum(digits) / len(digits) if digits else 5
+        steps_per_digit = max(X_MIN_STEPS_PER_DIGIT, (board.n_rows + board.n_cols) // 4)
+        rate = 100 * avg_digit * (m + 1) / steps_per_digit  # puntos por turno
+
+        def plan(first_dist, first_pts, second_pts):
+            pts = first_pts if first_dist <= turns else 0
+            if first_dist + between <= turns:
+                pts += second_pts
+            return pts + rate * max(0, turns - first_dist - between)
+
+        plan_a = plan(food_dist, digit * 100 * m, 50)
+        plan_b = plan(x_dist, 50, digit * 100 * (m + 1))
+        return plan_b > plan_a
+
+    # -- siguiente digito ----------------------------------------------------
+
+    @staticmethod
+    def _next_digit_positions(board):
+        """Copias del digito que viene DESPUES del objetivo actual. Hoy
+        son un digito equivocado (pisarlas cuesta -500), pero pasan a
+        ser el objetivo apenas alguien se come el actual."""
+        if board.target_digit is None:
+            return []
+        nxt = 1 if board.target_digit == 9 else board.target_digit + 1
+        return [pos for pos, v in board.digit_values.items() if v == nxt]
+
+    @staticmethod
+    def _my_dist(candidates, target):
+        """Menor cantidad de movimientos mios hasta `target` (o None)."""
+        best = None
+        for cand in candidates.values():
+            d = cand['safe_dist_map'].get(target)
+            if d is not None and (best is None or d + 1 < best):
+                best = d + 1
+        return best
+
+    def _opp_time_to(self, positions, bonus=0):
+        """Menor cantidad de movimientos del rival hasta alguna de
+        `positions` (mas `bonus`), o None si no tiene camino."""
+        dists = [self._opp_dist[p] for p in positions if p in self._opp_dist]
+        return min(dists) + bonus if dists else None
+
+    def _update_race(self, board):
+        """Actualiza cuantos turnos seguidos lleva el rival sin acercarse
+        al digito objetivo, y con eso el bonus que se le suma a su
+        distancia en la carrera (self._food_bonus)."""
+        current = self._opp_time_to(board.food)
+        key = (board.target_digit, tuple(sorted(board.food)))
+        if key != self._race_key or current is None or self._race_last is None:
+            self._race_stall = 0
+        elif current >= self._race_last:
+            self._race_stall = min(self._race_stall + 1, RACE_STALL_MAX)
+        else:
+            self._race_stall = max(self._race_stall - 1, 0)
+        self._race_key = key
+        self._race_last = current
+        self._food_bonus = RACE_STALL_BONUS * self._race_stall
+
+    def _via_x(self, board, candidates, positions):
+        """Cuanto tardo en llegar a alguna de `positions` pasando antes
+        por el 'X' mas conveniente (o None si no alcanzo ningun 'X')."""
+        best = None
+        for x in board.multiplier_pickups:
+            d_x = self._my_dist(candidates, x)
+            if d_x is None:
+                continue
+            total = d_x + min(board.manhattan(x, p) for p in positions)
+            if best is None or total < best:
+                best = total
+        return best
+
+    def _x_no_me_hace_perder(self, board, candidates, targets, opp_time=None):
+        """True si despues de comer un 'X' sigo llegando a `targets` antes
+        que el rival (en empate llego yo: muevo antes). Si no se pasa
+        opp_time, se usa lo que tarda el rival en llegar a `targets`."""
+        if opp_time is None:
+            opp_time = self._opp_time_to(targets)
+        via_x = self._via_x(board, candidates, targets)
+        if via_x is None:
+            return False
+        return opp_time is None or via_x <= opp_time
+
+    def _plan_siguiente_digito(self, board, candidates, safety_buffer, mult_step,
+                               my_multiplier=None, opp_multiplier=None):
+        """Devuelve la direccion para ir a esperar al lado de un digito
+        que viene despues del objetivo, o None si conviene otra cosa (ir
+        por un 'X', o territorio).
+
+        - Prueba el siguiente digito del orden; si el rival igual llega
+          antes (por ejemplo, porque esta pegado al objetivo), prueba el
+          que viene despues, y asi hasta NEXT_DIGITS_AHEAD digitos.
+        - Si puedo agarrar un 'X' y todavia llegar a ese digito antes
+          que el rival, voy por el 'X' (devuelvo None). Si mi
+          multiplicador esta por debajo del rival, acepto llegar hasta
+          X_CATCHUP_TOLERANCE pasos "tarde" segun el calculo.
+        - Si no, me acerco a las celdas vecinas del digito (no al digito
+          en si: hoy pisarlo cuesta -500).
+        """
+        # Cuanto tarda el rival: primero tiene que comerse el objetivo
+        # actual, despues ir hasta el siguiente, y asi.
+        opp_time = self._opp_time_to(board.food, self._food_bonus)
+        prev_positions = board.food
+        behind = (my_multiplier or 1) < (opp_multiplier or 1)
+        tolerance = X_CATCHUP_TOLERANCE if behind else 0
+        digit = board.target_digit
+        for _ in range(NEXT_DIGITS_AHEAD):
+            if digit is None:
+                return None
+            digit = 1 if digit == 9 else digit + 1
+            positions = [pos for pos, v in board.digit_values.items() if v == digit]
+            if not positions:
+                return None
+            if opp_time is not None and prev_positions:
+                opp_time += min(board.manhattan(a, b)
+                                for a in prev_positions for b in positions)
+
+            # Un 'X' vale la pena solo si despues sigo llegando primero.
+            x_deadline = None if opp_time is None else opp_time + tolerance
+            if mult_step is not None and self._x_no_me_hace_perder(
+                    board, candidates, positions, x_deadline):
+                return None
+
+            # Celdas donde esperar: las vecinas de cada copia, sin contar
+            # la celda donde ya estoy (asi me muevo entre ellas en vez de
+            # alejarme).
+            spots = set()
+            for pos in positions:
+                for _, cell in board.neighbors(pos):
+                    if (cell != board.head and cell not in board.digit_values
+                            and cell not in board.wall_cells):
+                        spots.add(cell)
+            step, my_time = self._best_target_move(candidates, spots, safety_buffer)
+            # Solo sirve esperar si llego antes que el rival (+1: desde la
+            # celda vecina todavia me falta el paso al digito).
+            if step is not None and (opp_time is None or my_time + 1 <= opp_time):
+                return step
+            prev_positions = positions
+        return None
 
     # -- pasos internos --------------------------------------------------
 
@@ -181,7 +394,7 @@ class SnakeStrategy:
             }
         return candidates
 
-    def _best_target_move(self, candidates, targets, safety_buffer):
+    def _best_target_move(self, candidates, targets, safety_buffer, opp_bonus=0):
         """Busca el paso mas conveniente hacia el mas cercano de
         `targets` (el digito objetivo, o los pickups 'X', segun con que
         se lo llame). Devuelve (direccion, distancia_total) del mejor
@@ -191,7 +404,9 @@ class SnakeStrategy:
 
         v6: `targets` puede traer varias copias del digito objetivo;
         se evaluan todas y gana la mas cercana alcanzable (cualquiera
-        vale lo mismo, y comer una borra las demas)."""
+        vale lo mismo, y comer una borra las demas).
+
+        `opp_bonus` se suma a la distancia del rival (ver _update_race)."""
         ranked = []
         for target in set(targets):
             best_step, best_key = None, None
@@ -225,7 +440,7 @@ class SnakeStrategy:
 
         for my_d, step, target in ranked:
             opp_d = self._opp_dist.get(target)
-            if opp_d is not None and opp_d < my_d:
+            if opp_d is not None and opp_d + opp_bonus < my_d:
                 continue
             cand = candidates[step]
             if cand['space'] >= cand['body_len'] + safety_buffer:

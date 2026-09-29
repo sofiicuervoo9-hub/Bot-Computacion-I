@@ -1,7 +1,9 @@
 """Tests unitarios de snake_ai.py (SnakeStrategy y el wrapper choose_direction)."""
 
 from board import Board, DIRECTIONS
-from snake_ai import SnakeStrategy, WRONG_DIGIT_STEP_PENALTY, choose_direction
+from snake_ai import (
+    RACE_STALL_BONUS, RACE_STALL_MAX, SnakeStrategy, WRONG_DIGIT_STEP_PENALTY, choose_direction,
+)
 
 
 def make_board_str(rows):
@@ -620,3 +622,314 @@ def test_wrapper_choose_direction_con_next_digit():
     board_str = '\n'.join('|' + ''.join(row) + '|' for row in grid)
     d = choose_direction(board_str, 'A', board_size=f'{n_rows}x{n_cols}', next_digit=3)
     assert d == 'right'
+
+
+# -- v4: decision por puntos --------------------------------------------
+
+V4_ROWS = ['............', '..XA.9......', '............', '.1........2.',
+           '............', '....3...4...', '............', '...........B']
+
+
+def test_v4_fin_de_partida_prefiere_el_9_multiplicado_a_la_x():
+    # X a 1 paso (+50), 9 a 2 pasos (900 x 3 = 2700), me quedan 2 turnos.
+    d = SnakeStrategy().choose_direction(
+        make_board_str(V4_ROWS), 'A', board_size='8x12', my_score=0, opp_score=0,
+        remaining_moves=4, my_multiplier=3, opp_multiplier=1)
+    assert d == 'right'
+
+
+def test_v4_ultimo_turno_agarra_la_x_si_el_digito_no_llega():
+    # Me queda 1 turno: el 9 (a 2 pasos) no llega, la X suma 50.
+    d = SnakeStrategy().choose_direction(
+        make_board_str(V4_ROWS), 'A', board_size='8x12', my_score=0, opp_score=0,
+        remaining_moves=2, my_multiplier=3, opp_multiplier=1)
+    assert d == 'left'
+
+
+def test_v4_principio_de_partida_prefiere_la_x_cercana():
+    # Con toda la partida por delante el multiplicador se amortiza.
+    rows = ['............', '..XA...1....', '............', '.5........2.',
+            '............', '....3...4...', '............', '...........B']
+    d = SnakeStrategy().choose_direction(
+        make_board_str(rows), 'A', board_size='8x12', my_score=0, opp_score=0,
+        remaining_moves=300, my_multiplier=1, opp_multiplier=1)
+    assert d == 'left'
+
+
+def test_v4_sin_remaining_moves_asume_partida_larga():
+    rows = ['............', '..XA...1....', '............', '.5........2.',
+            '............', '....3...4...', '............', '...........B']
+    d = SnakeStrategy().choose_direction(make_board_str(rows), 'A', board_size='8x12')
+    assert d == 'left'
+
+
+def test_v4_turnos_propios_son_la_mitad_de_remaining_moves():
+    assert SnakeStrategy._my_turns_left(300) == 150
+    assert SnakeStrategy._my_turns_left(3) == 2
+
+
+# -- esperar al lado del siguiente digito --------------------------------
+# Tableros reales de una partida perdida (my_match 5): el rival llegaba
+# antes al objetivo y el bot se iba a juntar 'X' en vez de esperar al
+# siguiente digito.
+
+TURNO_33 = ('|               |\n|               |\n|#           X  |\n|#              |\n'
+            '|#   4          |\n|#        3     |\n|#   6 Aaa      |\n|#   bB  a      |\n'
+            '|#   b          |\n|#   b     X    |\n|#              |\n|#              |\n'
+            '|#      7       |\n| 5             |\n')
+
+TURNO_57 = ('| 8  #######    |\n|               |\n|            X  |\n|               |\n'
+            '|    4 Aaaa     |\n|         a     |\n|    6          |\n|               |\n'
+            '|               |\n|               |\n|               |\n|          b    |\n'
+            '|       7  bbBX |\n| 5             |\n')
+
+
+def test_rival_gana_el_3_voy_a_esperar_al_4_en_vez_de_la_x():
+    # Objetivo 3: el rival esta a 3 pasos. El 4 (siguiente) me queda cerca;
+    # antes el bot bajaba a buscar la X de (9,10) y perdia tambien el 4.
+    d = SnakeStrategy().choose_direction(
+        TURNO_33, 'B', board_size='14x15', my_score=713, opp_score=712,
+        remaining_moves=267, my_multiplier=3, opp_multiplier=5)
+    assert d == 'up'
+
+
+def test_agarro_la_x_pegada_si_igual_llego_al_siguiente_digito():
+    # La X esta al lado y despues de comerla sigo llegando al 5 antes
+    # que el rival (que primero tiene que comerse el 4).
+    d = SnakeStrategy().choose_direction(
+        TURNO_57, 'B', board_size='14x15', my_score=823, opp_score=2223,
+        remaining_moves=243, my_multiplier=5, opp_multiplier=5)
+    assert d == 'right'
+
+
+def test_siguiente_digito_da_la_vuelta_de_9_a_1():
+    board = Board(make_board_str(['9....', '.A...', '...1B', '6.7.8']), 'A', '4x5')
+    assert board.target_digit == 6
+    assert SnakeStrategy._next_digit_positions(board) == [(3, 2)]
+    board = Board(make_board_str(['9....', '.A...', '...1B', '..2.3']), 'A', '4x5')
+    assert board.target_digit == 9
+    assert SnakeStrategy._next_digit_positions(board) == [(2, 3)]
+
+
+def test_sin_digitos_no_hay_siguiente():
+    board = Board(make_board_str(['.....', '.A...', '....B']), 'A', '3x5')
+    assert SnakeStrategy._next_digit_positions(board) == []
+    s = SnakeStrategy()
+    assert s._plan_siguiente_digito(board, s._build_candidates(board), 0, None) is None
+
+
+def test_espera_al_lado_del_siguiente_sin_pisarlo():
+    # El 1 lo alcanza primero el rival (pegado). El 2 esta a mi lado:
+    # no lo piso (hoy es un digito equivocado), me muevo a una celda vecina.
+    rows = ['..........',
+            '.2A.......',
+            '..........',
+            '..........',
+            '.......1B.',
+            '..........']
+    d = SnakeStrategy().choose_direction(make_board_str(rows), 'A', board_size='6x10',
+                                         my_score=0, opp_score=0, remaining_moves=200)
+    assert d in ('up', 'down')
+
+
+def test_x_inalcanzable_no_cuenta_para_el_plan():
+    # Hay una X encerrada (sin camino): no se usa para comparar.
+    rows = ['........#X',
+            '.2A.....##',
+            '..........',
+            '..........',
+            '.......1B.',
+            '..........']
+    board = Board(make_board_str(rows), 'A', '6x10')
+    s = SnakeStrategy()
+    cands = s._build_candidates(board)
+    assert s._my_dist(cands, (0, 9)) is None
+    assert s._plan_siguiente_digito(board, cands, 0, 'left') in ('up', 'down')
+
+
+def test_rival_sin_camino_al_objetivo_igual_voy_al_siguiente():
+    # El rival no tiene camino al 1: opp_to_next queda en None y la X
+    # cercana gana (siempre llego primero).
+    rows = ['..X.......',
+            '.2A.......',
+            '..........',
+            '######....',
+            '1....#..B.',
+            '.....#....']
+    board = Board(make_board_str(rows), 'A', '6x10')
+    s = SnakeStrategy()
+    cands = s._build_candidates(board)
+    assert s._plan_siguiente_digito(board, cands, 0, 'up') is None
+
+
+# -- arreglos de la partida my_match 6 -----------------------------------
+
+TURNO_17_M6 = ('|                    |\n|                    |\n|    aaA   X         |\n'
+               '|   2                |\n|               X    |\n|                    |\n'
+               '| #######            |\n|                    |\n|                    |\n'
+               '|              Bb    |\n|       1       b    |\n|     45         3   |\n'
+               '|                    |\n|                    |\n')
+
+TURNO_121_M6 = ('|                    |\n|      6             |\n|        #        7  |\n'
+                '| aaa                |\n|   a                |\n|   A                |\n'
+                '|                    |\n|              X   8 |\n|                    |\n'
+                '|                    |\n|                  b |\n|     45         Bbb |\n'
+                '|                    |\n|     X              |\n')
+
+
+def test_no_encadena_x_si_pierdo_la_carrera_por_el_digito():
+    # Estoy a 8 del 1 y el rival a 11. La X de arriba conviene en puntos,
+    # pero despues de comerla el rival llega antes al 1. Voy al digito.
+    d = SnakeStrategy().choose_direction(
+        TURNO_17_M6, 'B', board_size='14x20', my_score=106, opp_score=58,
+        remaining_moves=283, my_multiplier=3, opp_multiplier=2)
+    assert d == 'down'
+
+
+def test_no_espera_al_5_si_esta_pegado_al_4_del_rival():
+    # El 4 y el 5 estan pegados: el rival se come los dos seguidos. Antes
+    # el bot iba a esperar al 5 (left) y llegaba tarde.
+    d = SnakeStrategy().choose_direction(
+        TURNO_121_M6, 'B', board_size='14x20', my_score=3151, opp_score=1853,
+        remaining_moves=179, my_multiplier=9, opp_multiplier=7)
+    assert d != 'left'
+
+
+def test_si_falta_el_digito_siguiente_no_hay_plan():
+    # Solo hay 1 y 2: el 2 lo gana el rival y el 3 no esta en el tablero.
+    rows = ['A...........',
+            '............',
+            '.........1B.',
+            '.........2..']
+    board = Board(make_board_str(rows), 'A', '4x12')
+    s = SnakeStrategy()
+    assert s._plan_siguiente_digito(board, s._build_candidates(board), 0, None) is None
+
+
+def test_si_el_rival_gana_todas_las_carreras_no_hay_plan():
+    # El rival esta pegado al 1 y el 2, 3 y 4 estan a su lado: no llego
+    # antes a ninguno de los NEXT_DIGITS_AHEAD digitos siguientes.
+    rows = ['A..........5',
+            '............',
+            '............',
+            '............',
+            '............',
+            '.........B1.',
+            '..........23',
+            '..........4.']
+    board = Board(make_board_str(rows), 'A', '8x12')
+    s = SnakeStrategy()
+    assert s._plan_siguiente_digito(board, s._build_candidates(board), 0, None) is None
+
+
+# -- partida my_match 7: multiplicador atrasado --------------------------
+
+TURNO_62_M7 = ('|            X      |\n|  2                |\n|                   |\n'
+               '|                   |\n|                   |\n|                   |\n'
+               '|                   |\n|     1             |\n|        Bb         |\n'
+               '|7        b         |\n|         bb        |\n|                   |\n'
+               '|          a        |\n|          a        |\n|   8      a        |\n'
+               '|       Aaaa    9   |\n|             X     |\n|        #########  |\n'
+               '|                   |\n')
+
+
+def test_con_multiplicador_atrasado_paso_por_la_x_antes_de_esperar():
+    # El rival (x3) va por el 7; yo (x1) espero al 8. Pasar por la X de
+    # abajo me hace llegar al 8 dos pasos "tarde" segun el calculo, pero
+    # estando atrasada en multiplicador vale la pena (el rival tardo 21
+    # turnos en llegar al 7, no 9).
+    d = SnakeStrategy().choose_direction(
+        TURNO_62_M7, 'A', board_size='19x19', my_score=1627, opp_score=1227,
+        remaining_moves=238, my_multiplier=1, opp_multiplier=3)
+    assert d == 'down'
+
+
+def test_con_multiplicador_parejo_no_arriesga_el_siguiente_digito():
+    # Mismo tablero, pero con multiplicadores parejos: sigue esperando.
+    d = SnakeStrategy().choose_direction(
+        TURNO_62_M7, 'A', board_size='19x19', my_score=1627, opp_score=1227,
+        remaining_moves=238, my_multiplier=3, opp_multiplier=3)
+    assert d == 'up'
+
+
+# -- partida my_match 9: el rival no va derecho al objetivo ---------------
+
+TURNOS_53_A_59_M9 = [
+    ('|                |\n|       8        |\n|                |\n|                |\n'
+     '|      #         |\n|             7  |\n| 4    A      X  |\n|      aa        |\n'
+     '| 6     a        |\n|                |\n|        bbb     |\n|        b       |\n'
+     '|        B  X    |\n|           5    |\n|                |\n|                |\n'
+     '|                |\n|                |\n|                |\n', 1022, 1024, 247, 3, 3),
+    ('|                |\n|       8        |\n|                |\n|                |\n'
+     '|                |\n|             7  |\n| 4    aA     X  |\n|      aa        |\n'
+     '| 6              |\n|                |\n|        bb      |\n| ###    b       |\n'
+     '|        bB X    |\n|           5    |\n|                |\n|                |\n'
+     '|                |\n|                |\n|                |\n', 1023, 1025, 245, 3, 3),
+    ('|                |\n|       8        |\n|                |\n|                |\n'
+     '|                |\n|             7  |\n| 4    aa     X  |\n|      aA        |\n'
+     '| 6              |\n|                |\n|        b       |\n|  #     b       |\n'
+     '|        bbBX    |\n|           5    |\n|                |\n|                |\n'
+     '|                |\n|                |\n|                |\n', 1024, 1026, 243, 3, 3),
+    ('|                |\n|       8        |\n|                |\n|                |\n'
+     '|                |\n|             7  |\n| 4    aa     X  |\n|       aA       |\n'
+     '| 6              |\n|                |\n|                |\n|        b       |\n'
+     '|        bbbB    |\n|           5    |\n|                |\n|    #########   |\n'
+     '|            X   |\n|                |\n|                |\n', 1074, 1027, 241, 4, 3),
+]
+
+
+def _jugar_turno(strategy, turno):
+    board_str, my_score, opp_score, remaining, my_mult, opp_mult = turno
+    return strategy.choose_direction(
+        board_str, 'B', board_size='19x16', my_score=my_score, opp_score=opp_score,
+        remaining_moves=remaining, my_multiplier=my_mult, opp_multiplier=opp_mult)
+
+
+def test_si_el_rival_se_aleja_del_objetivo_voy_a_disputarlo():
+    # El rival (A) esta mas cerca del 4, pero turno a turno se aleja
+    # (5 -> 8 -> 9 -> 10 pasos) porque anda juntando X. En la partida
+    # real tardo 28 turnos en comerselo (2400 puntos). Despues de 3
+    # turnos sin acercarse, el bot va a disputarlo.
+    strategy = SnakeStrategy()
+    for turno in TURNOS_53_A_59_M9[:-1]:
+        _jugar_turno(strategy, turno)
+    assert strategy._race_stall == 2
+    assert _jugar_turno(strategy, TURNOS_53_A_59_M9[-1]) == 'up'
+    assert strategy._race_stall == 3
+
+
+def test_sin_historial_el_rival_mas_cerca_gana_la_carrera():
+    # El mismo tablero visto sin historial (primer turno): como antes,
+    # el bot no disputa el 4.
+    assert _jugar_turno(SnakeStrategy(), TURNOS_53_A_59_M9[-1]) == 'right'
+
+
+def _race_board(opp_col, digit_col=0):
+    row = ['.'] * 12
+    row[digit_col] = '1'
+    row[opp_col] = 'B'
+    rows = ['A...........', '............', ''.join(row)]
+    return Board(make_board_str(rows), 'A', '3x12')
+
+
+def test_update_race_sube_baja_tope_y_reinicio():
+    s = SnakeStrategy()
+
+    def paso(board):
+        s._opp_dist = board.bfs_all_distances(board.opponent_head, set())
+        s._update_race(board)
+
+    paso(_race_board(5))
+    assert s._race_stall == 0            # primer turno: sin historial
+    paso(_race_board(6))
+    assert s._race_stall == 1            # se alejo
+    paso(_race_board(6))
+    assert s._race_stall == 2            # no se acerco
+    assert s._food_bonus == 2 * RACE_STALL_BONUS
+    paso(_race_board(5))
+    assert s._race_stall == 1            # se acerco: descuenta de a uno
+    for _ in range(RACE_STALL_MAX + 5):
+        paso(_race_board(11))
+    assert s._race_stall == RACE_STALL_MAX
+    paso(_race_board(11, digit_col=3))   # el objetivo cambio de lugar
+    assert s._race_stall == 0
