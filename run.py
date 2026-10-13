@@ -16,6 +16,21 @@ from board import DIRECTIONS
 from snake_ai import SnakeStrategy
 
 
+def safe_print(text):
+    """print() que nunca rompe por encoding.
+
+    v7/v8: el tablero trae simbolos no ASCII (Ⓐ/Ⓑ, 💣/🧨). En la consola
+    de Windows (cp1252) un print() comun de esos caracteres tira
+    UnicodeEncodeError: si pasa al imprimir el tablero se pierde el turno,
+    y si pasa al imprimir el mensaje crudo se corta la conexion. Si la
+    consola no los soporta, se imprimen como escapes (\u24b6, ...).
+    """
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(str(text).encode('ascii', 'backslashreplace').decode('ascii'))
+
+
 class GameLogger:
     """Guarda el historial (recibido/enviado) de cada partida y lo
     vuelca a game_<id>.log cuando termina.
@@ -49,7 +64,7 @@ class GameLogger:
 
     def write(self, game_id):
         try:
-            with open(f"game_{game_id}.log", "w") as f:
+            with open(f"game_{game_id}.log", "w", encoding="utf-8") as f:
                 f.write("\n".join(self._history.get(game_id, [])) + "\n")
             print(f"saved game_{game_id}.log")
         except OSError as e:
@@ -61,8 +76,8 @@ class GameLogger:
 class SnakeBot:
     """Cliente del Code Challenge para el juego Snake."""
 
-    # Margen de sobra: benchmarks locales (tableros 12x12 a 20x20, con
-    # cuerpos largos) dan ~1-4ms por decision, muy por debajo de esto.
+    # Margen de sobra: benchmarks locales (tableros 20x20 a 30x30 de v8,
+    # con bombas y cuerpos largos) quedan muy por debajo de esto.
     # Es una red de seguridad, no el tiempo esperado real.
     DECISION_TIMEOUT = 1.0  # segundos
 
@@ -91,7 +106,7 @@ class SnakeBot:
 
     async def _send(self, websocket, action, data):
         message = json.dumps({'action': action, 'data': data})
-        print(message)
+        safe_print(message)
         await websocket.send(message)
 
     async def _play(self, websocket):
@@ -102,7 +117,7 @@ class SnakeBot:
                 print(f'connection closed: {e}')
                 break
 
-            print(f"< {request}")
+            safe_print(f"< {request}")
             try:
                 await self._handle(websocket, json.loads(request))
             except Exception as e:
@@ -149,7 +164,7 @@ class SnakeBot:
             my_multiplier, opp_multiplier = data.get('multiplier_2'), data.get('multiplier_1')
         remaining_moves = data.get('remaining_moves')
 
-        print(board_str)
+        safe_print(board_str)
         start = time.perf_counter()
         try:
             direction = self._choose_direction_con_limite(

@@ -54,6 +54,36 @@ copias del objetivo -- cualquiera sirve, conviene ir a la mas cercana
 (comer una sigue costando -500). ``target_digit_pos`` se mantiene por
 compatibilidad (primera copia encontrada); la lista completa esta en
 ``target_digit_positions``.
+
+Desde el 7/10/2026 (v7) chocar (contra un cuerpo, el borde, el muro o
+el rival) ya no termina la partida: la vibora no se mueve, se queda
+con 3 celdas y el resto del cuerpo se convierte en "comida de cola"
+que solo puede comer el RIVAL. En el tablero se dibuja con la letra
+de quien la puede comer dentro de un circulo: Ⓐ (U+24B6) solo la come
+A, Ⓑ (U+24B7) solo la come B. Para mi:
+  - ``tail_food``: las celdas con MI letra -- comida que dejo el rival
+    al chocar (+100 x multiplicador, hace crecer, sin orden, sin
+    penalidad).
+  - ``own_shed_tail``: las celdas con la letra del rival -- mi propia
+    cola perdida. Pisarla la borra (sin puntos ni crecimiento), asi se
+    la niego al rival.
+Las dos son celdas transitables.
+
+Desde el 14/10/2026 (v8) hay bombas de proximidad: dos grandes (💣,
+U+1F4A3) y cinco chicas (🧨, U+1F9E8). Explotan cuando MI CABEZA
+termina un movimiento a 2 celdas o menos de una 💣, o a 1 celda o
+menos de una 🧨, contando la diagonal como 1 (distancia de Chebyshev:
+max(|dfila|, |dcol|)). O sea, la zona prohibida es un cuadrado de 5x5
+alrededor de 💣 y de 3x3 alrededor de 🧨. Explotar deja el puntaje en
+0 (o -500 si ya estaba en 0 o menos). ``bomb_zone`` tiene todas esas
+celdas. Nunca hay comida ni 'X' adentro de una zona, asi que siempre
+se puede jugar sin entrar. Despues de la ronda 150 el servidor saca
+todas las bombas: como el Board se arma desde el tablero de cada
+turno, la zona simplemente queda vacia.
+
+Los simbolos nuevos no son ASCII: en Python cada uno es UN caracter
+del string (``list(fila)`` los separa bien), asi que el parseo por
+caracter sigue funcionando sin cambios.
 """
 
 from collections import deque
@@ -64,6 +94,19 @@ DIRECTIONS = {
     'left':  (0, -1),   # fila igual, columna -1  -> vas una columna a la izquierda
     'right': (0, 1),    # fila igual, columna +1  -> vas una columna a la derecha
 }
+
+# v7: comida de cola. Se comparan contra los escapes para no depender
+# del encoding con el que se guarde este archivo.
+TAIL_FOOD = {'A': 'Ⓐ', 'B': 'Ⓑ'}   # Ⓐ / Ⓑ
+
+# v8: bombas de proximidad -> radio de explosion (distancia de Chebyshev).
+BIG_BOMB = '\U0001F4A3'     # 💣
+SMALL_BOMB = '\U0001F9E8'   # 🧨
+BOMB_RADIUS = {BIG_BOMB: 2, SMALL_BOMB: 1}
+
+# Selector de variacion de emoji: si llegara pegado a una bomba, no es
+# una celda aparte -- se descarta antes de partir las filas.
+_VARIATION_SELECTOR = '️'
 
 
 class Board:
@@ -79,6 +122,8 @@ class Board:
         self.my_body_char = side.lower()
         self.opponent = 'B' if side == 'A' else 'A'
         self.opponent_body = self.opponent.lower()
+        self.my_tail_food_char = TAIL_FOOD.get(side)
+        self.opp_tail_food_char = TAIL_FOOD.get(self.opponent)
 
         self.grid = self._parse_grid(board_str)
         self.n_rows, self.n_cols = self._resolve_dimensions(board_size)
@@ -91,7 +136,11 @@ class Board:
         self.wall_cells = set()
         self.opponent_blocked = set()
         self.body_cells = set()
+        self.tail_food = []          # v7: Ⓐ/Ⓑ que puedo comer yo
+        self.own_shed_tail = []      # v7: mi cola perdida (la come el rival)
+        self.bombs = []              # v8: [(pos, radio)]
         self._scan_cells()
+        self.bomb_zone = self._compute_bomb_zone()
 
         # v3: si hay digitos en tablero, el unico objetivo valido es el
         # digito "correcto" (el resto son trampas de -500, no comida).
@@ -129,6 +178,7 @@ class Board:
 
     @staticmethod
     def _parse_grid(board_str):
+        board_str = board_str.replace(_VARIATION_SELECTOR, '')
         rows = [line[1:-1] for line in board_str.split('\n') if line.startswith('|')]
         return [list(row) for row in rows]
 
@@ -177,6 +227,23 @@ class Board:
                     self.opponent_blocked.add((r, c))
                 elif ch == self.opponent_body:
                     self.opponent_blocked.add((r, c))
+                elif ch == self.my_tail_food_char:
+                    self.tail_food.append((r, c))
+                elif ch == self.opp_tail_food_char:
+                    self.own_shed_tail.append((r, c))
+                elif ch in BOMB_RADIUS:
+                    self.bombs.append(((r, c), BOMB_RADIUS[ch]))
+
+    def _compute_bomb_zone(self):
+        """v8: celdas donde, si mi cabeza termina el movimiento, explota
+        alguna bomba (cuadrado de lado 2*radio+1, recortado al tablero).
+        Incluye la celda de la bomba misma."""
+        zone = set()
+        for (br, bc), radius in self.bombs:
+            for r in range(max(0, br - radius), min(self.n_rows, br + radius + 1)):
+                for c in range(max(0, bc - radius), min(self.n_cols, bc + radius + 1)):
+                    zone.add((r, c))
+        return zone
 
     @staticmethod
     def _cyclic_prev(digit):
@@ -238,6 +305,11 @@ class Board:
     @staticmethod
     def manhattan(a, b):
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    @staticmethod
+    def chebyshev(a, b):
+        """v8: distancia con la que se miden las bombas (diagonal = 1)."""
+        return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
 
     def bfs_all_distances(self, start, blocked):
         """Distancia minima desde start a cada celda alcanzable, evitando blocked."""

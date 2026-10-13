@@ -305,3 +305,94 @@ def test_sin_muro_lista_vacia():
     board_str = make_board_str(['.....', '.A*..'])
     b = Board(board_str, 'A')
     assert b.wall_cells == set()
+
+
+# -- v7: comida de cola (Ⓐ / Ⓑ) -------------------------------------------
+
+TA, TB = 'Ⓐ', 'Ⓑ'   # Ⓐ / Ⓑ
+
+
+def test_v7_side_a_come_la_cola_con_su_letra():
+    board_str = make_board_str(['..' + TA + TA + '..', '.A....', '..' + TB + '..B'])
+    b = Board(board_str, 'A')
+    assert set(b.tail_food) == {(0, 2), (0, 3)}
+    assert b.own_shed_tail == [(2, 2)]
+
+
+def test_v7_side_b_ve_las_colas_al_reves():
+    board_str = make_board_str(['..' + TA + TA + '..', '.A....', '..' + TB + '..B'])
+    b = Board(board_str, 'B')
+    assert b.tail_food == [(2, 2)]
+    assert set(b.own_shed_tail) == {(0, 2), (0, 3)}
+
+
+def test_v7_comida_de_cola_no_se_confunde_con_otras_celdas():
+    board_str = make_board_str(['.1' + TA + '..', 'A..2.', '.' + TB + '.3.', '4....', '....5'])
+    b = Board(board_str, 'A')
+    for cell in [(0, 2), (2, 1)]:
+        assert cell not in b.digit_values
+        assert cell not in b.body_cells
+        assert cell not in b.opponent_blocked
+        assert cell not in b.wall_cells
+        assert cell not in b.bomb_zone
+
+
+# -- v8: bombas de proximidad (💣 / 🧨) ------------------------------------
+
+BIG, SMALL = '\U0001F4A3', '\U0001F9E8'
+
+
+def test_v8_cada_bomba_ocupa_una_sola_columna():
+    # Si el emoji contara como 2 caracteres, la cabeza quedaria corrida.
+    board_str = make_board_str([BIG + '......A', SMALL + '.......'])
+    b = Board(board_str, 'A', board_size='2x8')
+    assert b.head == (0, 7)
+    assert set(b.bombs) == {((0, 0), 2), ((1, 0), 1)}
+
+
+def test_v8_zona_de_bomba_grande_es_5x5_y_la_chica_3x3():
+    rows = ['.' * 9 for _ in range(9)]
+    rows[4] = '....' + BIG + '....'
+    b = Board(make_board_str(rows), 'A', board_size='9x9')
+    assert len(b.bomb_zone) == 25
+    assert (2, 2) in b.bomb_zone and (6, 6) in b.bomb_zone   # diagonal a 2
+    assert (1, 4) not in b.bomb_zone and (4, 7) not in b.bomb_zone
+
+    rows[4] = '....' + SMALL + '....'
+    b = Board(make_board_str(rows), 'A', board_size='9x9')
+    assert len(b.bomb_zone) == 9
+    assert (3, 3) in b.bomb_zone and (5, 5) in b.bomb_zone
+    assert (2, 4) not in b.bomb_zone
+
+
+def test_v8_zona_se_recorta_en_el_borde():
+    b = Board(make_board_str([BIG + '....', '.....', '.....', '....A']), 'A', board_size='4x5')
+    assert len(b.bomb_zone) == 9   # esquina: solo 3x3 adentro del tablero
+    assert all(0 <= r < 4 and 0 <= c < 5 for r, c in b.bomb_zone)
+
+
+def test_v8_zonas_superpuestas_no_duplican_celdas():
+    b = Board(make_board_str([SMALL + SMALL + '...', '.....', '....A']), 'A', board_size='3x5')
+    assert b.bomb_zone == {(r, c) for r in range(2) for c in range(3)}
+
+
+def test_v8_sin_bombas_zona_vacia():
+    b = Board(make_board_str(['.....', '.A*..']), 'A')
+    assert b.bombs == [] and b.bomb_zone == set()
+
+
+def test_v8_selector_de_variacion_se_ignora():
+    b = Board(make_board_str([BIG + '️' + '...A']), 'A', board_size='1x5')
+    assert b.head == (0, 4)
+    assert b.bombs == [((0, 0), 2)]
+
+
+def test_v8_bomba_no_es_digito_ni_bloqueo():
+    b = Board(make_board_str(['.1...', 'A..2.', '...3.', '4.' + BIG + '..', '....5']), 'A')
+    assert (3, 2) not in b.digit_values
+    assert (3, 2) not in b.body_cells and (3, 2) not in b.opponent_blocked
+
+
+def test_chebyshev():
+    assert Board.chebyshev((0, 0), (2, 1)) == 2
+    assert Board.chebyshev((3, 3), (3, 3)) == 0

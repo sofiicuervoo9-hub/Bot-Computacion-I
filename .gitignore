@@ -133,3 +133,6 @@ start_dev.sh
 
 # game logs written at the end of each match
 logs/
+
+
+simulador/*/

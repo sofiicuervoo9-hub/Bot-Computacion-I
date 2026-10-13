@@ -93,8 +93,6 @@ def test_sin_movimiento_seguro_no_rompe():
 
 def test_safety_buffer_se_activa_cuando_voy_ganando_y_quedan_pocos_turnos():
     strategy = SnakeStrategy(safety_buffer=3)
-    board = None  # construido via Board dentro de choose_direction
-
     # Con el buffer activo, evita ir a comer si el espacio resultante
     # queda muy justo -- lo confirmamos indirectamente: no explota y
     # sigue devolviendo una direccion valida.
@@ -323,9 +321,12 @@ def test_va_al_pickup_de_multiplicador_si_no_hay_comida():
     assert d == 'down'
 
 
-def test_prioriza_digito_correcto_sobre_pickup_de_multiplicador():
-    # El digito correcto (2) esta pegado a la cabeza; el pickup 'X' esta
-    # mas lejos -- el digito, que ademas hace crecer, gana la prioridad.
+def test_al_principio_x_lejana_le_gana_a_un_digito_chico_pegado():
+    # El digito correcto (2) esta pegado a la cabeza; el 'X' a 12 pasos.
+    # Con 100 turnos por delante, el 'X' rinde ~7000 puntos estimados
+    # (~590 por paso) contra 200 del 2 (200 por paso): va por el 'X'.
+    # Antes se comia primero el 2; en el simulador la regla "digito
+    # primero si igual llego al X" perdio 40-60 (DIGIT_FIRST_IF_BOTH).
     strategy = SnakeStrategy()
     n_rows, n_cols = 10, 10
     grid = [['.' for _ in range(n_cols)] for _ in range(n_rows)]
@@ -341,7 +342,7 @@ def test_prioriza_digito_correcto_sobre_pickup_de_multiplicador():
         board_str, 'A', board_size=f'{n_rows}x{n_cols}', next_digit=2,
         my_score=0, opp_score=0, remaining_moves=200,
     )
-    assert d == 'right'
+    assert d == 'down'
 
 
 def test_va_por_el_pickup_cuando_esta_mas_cerca_que_el_digito():
@@ -684,13 +685,17 @@ TURNO_57 = ('| 8  #######    |\n|               |\n|            X  |\n|         
             '|       7  bbBX |\n| 5             |\n')
 
 
-def test_rival_gana_el_3_voy_a_esperar_al_4_en_vez_de_la_x():
-    # Objetivo 3: el rival esta a 3 pasos. El 4 (siguiente) me queda cerca;
-    # antes el bot bajaba a buscar la X de (9,10) y perdia tambien el 4.
+def test_rival_gana_el_3_con_mucha_partida_por_delante_va_por_la_x():
+    # Objetivo 3: el rival esta a 3 pasos. Antes (partida my_match 5) el
+    # bot iba a esperar al 4 (1200 puntos a x3). Con el simulador local
+    # (sim.py), valorar mas las X gano claramente: sin la regla
+    # X_OVER_WAIT_RATIO el bot perdio 51-69, y X_DIGIT_SHARE = 1.0 le gano
+    # a 0.5 por 72-48. Con 133 turnos por delante, la X (~9600 puntos
+    # estimados) rinde mucho mas que el 4: baja a buscarla.
     d = SnakeStrategy().choose_direction(
         TURNO_33, 'B', board_size='14x15', my_score=713, opp_score=712,
         remaining_moves=267, my_multiplier=3, opp_multiplier=5)
-    assert d == 'up'
+    assert d == 'down'
 
 
 def test_agarro_la_x_pegada_si_igual_llego_al_siguiente_digito():
@@ -777,13 +782,16 @@ TURNO_121_M6 = ('|                    |\n|      6             |\n|        #     
                 '|                    |\n|     X              |\n')
 
 
-def test_no_encadena_x_si_pierdo_la_carrera_por_el_digito():
-    # Estoy a 8 del 1 y el rival a 11. La X de arriba conviene en puntos,
-    # pero despues de comerla el rival llega antes al 1. Voy al digito.
+def test_al_principio_la_x_vale_mas_que_un_1():
+    # Estoy a 8 del 1 y el rival a 11. Despues de comer la X el rival
+    # llega antes al 1. Antes (partida my_match 6) el bot iba al 1; con
+    # X_MODE 'valor' se comparan puntos por paso: el 1 vale 300 (x3) y la
+    # X, con 141 turnos por delante, unos 5400. Va por la X (arriba). En
+    # el simulador este criterio le gano 61-39 al anterior.
     d = SnakeStrategy().choose_direction(
         TURNO_17_M6, 'B', board_size='14x20', my_score=106, opp_score=58,
         remaining_moves=283, my_multiplier=3, opp_multiplier=2)
-    assert d == 'down'
+    assert d == 'up'
 
 
 def test_no_espera_al_5_si_esta_pegado_al_4_del_rival():
@@ -890,12 +898,21 @@ def test_si_el_rival_se_aleja_del_objetivo_voy_a_disputarlo():
     # (5 -> 8 -> 9 -> 10 pasos) porque anda juntando X. En la partida
     # real tardo 28 turnos en comerselo (2400 puntos). Despues de 3
     # turnos sin acercarse, el bot va a disputarlo.
+    # Con X_MODE 'valor' la decision final puede ser una X; lo que se
+    # verifica es que el bonus de carrera habilita disputar el 4.
     strategy = SnakeStrategy()
     for turno in TURNOS_53_A_59_M9[:-1]:
         _jugar_turno(strategy, turno)
     assert strategy._race_stall == 2
-    assert _jugar_turno(strategy, TURNOS_53_A_59_M9[-1]) == 'up'
+    _jugar_turno(strategy, TURNOS_53_A_59_M9[-1])
     assert strategy._race_stall == 3
+    board = Board(TURNOS_53_A_59_M9[-1][0], 'B', '19x16')
+    cands = strategy._build_candidates(board)
+    con_bonus = strategy._best_target_move(cands, board.food, 0,
+                                           opp_bonus=strategy._food_bonus, shared=True)
+    sin_bonus = strategy._best_target_move(cands, board.food, 0, shared=True)
+    assert sin_bonus == (None, None)
+    assert con_bonus[0] == 'up'
 
 
 def test_sin_historial_el_rival_mas_cerca_gana_la_carrera():
@@ -933,3 +950,443 @@ def test_update_race_sube_baja_tope_y_reinicio():
     assert s._race_stall == RACE_STALL_MAX
     paso(_race_board(11, digit_col=3))   # el objetivo cambio de lugar
     assert s._race_stall == 0
+
+# -- v7: choques y comida de cola ---------------------------------------
+
+
+from snake_ai import FIXED_PENALTY, TAIL_FOOD_POINTS  # noqa: E402
+
+TA, TB = 'Ⓐ', 'Ⓑ'   # Ⓐ / Ⓑ
+
+
+def _grid(n_rows, n_cols):
+    return [['.' for _ in range(n_cols)] for _ in range(n_rows)]
+
+
+def _board_str(grid):
+    return '\n'.join('|' + ''.join(row) + '|' for row in grid)
+
+
+def test_v7_va_a_la_comida_de_cola_si_no_hay_digito():
+    g = _grid(8, 8)
+    g[4][4] = 'A'
+    g[4][5] = TA
+    g[4][6] = TA
+    g[0][0] = 'B'
+    d = SnakeStrategy().choose_direction(_board_str(g), 'A', board_size='8x8',
+                                         my_score=0, opp_score=0, remaining_moves=300)
+    assert d == 'right'
+
+
+def test_v7_side_b_come_su_propia_letra():
+    g = _grid(8, 8)
+    g[4][4] = 'B'
+    g[3][4] = TB      # comida para B
+    g[5][4] = TA      # no es para B
+    g[0][0] = 'A'
+    d = SnakeStrategy().choose_direction(_board_str(g), 'B', board_size='8x8',
+                                         my_score=0, opp_score=0, remaining_moves=300)
+    assert d == 'up'
+
+
+def test_v7_comida_de_cola_hace_crecer():
+    board = Board(make_board_str(['.......', '.aaA' + TA + '..', '.......']), 'A')
+    cands = SnakeStrategy()._build_candidates(board)
+    assert cands['right']['body_len'] == len(board.body_cells) + 1
+    assert cands['up']['body_len'] == len(board.body_cells)
+
+
+def test_v7_digito_pegado_le_gana_a_la_cola_lejana():
+    # El 5 (500 pts) esta al lado; la cola (100 pts) a 2 pasos.
+    g = _grid(10, 10)
+    g[5][5] = 'A'
+    g[5][6] = '5'
+    g[5][3] = TA
+    for pos, v in [((0, 0), '6'), ((0, 9), '7'), ((9, 0), '8'), ((9, 9), '9')]:
+        g[pos[0]][pos[1]] = v
+    d = SnakeStrategy().choose_direction(_board_str(g), 'A', board_size='10x10', next_digit=5,
+                                         my_score=0, opp_score=0, remaining_moves=300)
+    assert d == 'right'
+
+
+def test_v7_cola_pegada_le_gana_al_digito_lejano():
+    # Cola al lado (100 pts en 1 paso) vs el 1 a 6 pasos, sin rival cerca.
+    g = _grid(10, 10)
+    g[5][5] = 'A'
+    g[4][5] = TA
+    g[5][0] = '1'
+    for pos, v in [((0, 0), '2'), ((0, 9), '3'), ((9, 0), '4'), ((9, 9), '5')]:
+        g[pos[0]][pos[1]] = v
+    g[9][5] = 'B'
+    d = SnakeStrategy().choose_direction(_board_str(g), 'A', board_size='10x10', next_digit=1,
+                                         my_score=0, opp_score=0, remaining_moves=300)
+    assert d == 'up'
+
+
+def test_v7_no_va_a_la_cola_si_pierdo_la_carrera_por_el_digito():
+    # El rival esta a 2 del 9; yo a 2 del 9 por derecha. Desviarme a la
+    # cola (arriba) me hace llegar tarde: voy al digito.
+    g = _grid(10, 10)
+    g[5][5] = 'A'
+    g[4][5] = TA
+    g[5][7] = '9'
+    g[5][9] = 'B'
+    for pos, v in [((0, 0), '1'), ((9, 0), '2'), ((9, 9), '3'), ((0, 9), '4')]:
+        g[pos[0]][pos[1]] = v
+    d = SnakeStrategy().choose_direction(_board_str(g), 'A', board_size='10x10', next_digit=9,
+                                         my_score=0, opp_score=0, remaining_moves=300)
+    assert d == 'right'
+
+
+def test_v7_pisa_su_cola_perdida_para_negarsela_al_rival():
+    g = _grid(8, 8)
+    g[4][4] = 'A'
+    g[4][3] = TB      # mi cola perdida: la come B
+    g[0][7] = 'B'
+    d = SnakeStrategy().choose_direction(_board_str(g), 'A', board_size='8x8',
+                                         my_score=0, opp_score=0, remaining_moves=300)
+    assert d == 'left'
+
+
+def test_v7_costo_de_choque():
+    board = Board(make_board_str(['aaaaaA..', '........']), 'A')   # 6 celdas
+    assert SnakeStrategy._crash_cost(board, 1200, 2) == 1200 + 3 * TAIL_FOOD_POINTS * 2
+    assert SnakeStrategy._crash_cost(board, 100, 1) == FIXED_PENALTY + 3 * TAIL_FOOD_POINTS
+    small = Board(make_board_str(['aaA.....']), 'A')
+    assert SnakeStrategy._crash_cost(small, None, None) == FIXED_PENALTY
+
+
+# -- v8: bombas de proximidad -------------------------------------------
+
+BIG, SMALL = '\U0001F4A3', '\U0001F9E8'
+
+
+def test_v8_no_se_mete_en_la_zona_de_una_bomba():
+    # Ir a la izquierda deja la cabeza a 2 de la 💣: explota.
+    g = _grid(9, 12)
+    g[4][2] = BIG
+    g[4][5] = 'A'
+    d = SnakeStrategy().choose_direction(_board_str(g), 'A', board_size='9x12',
+                                         my_score=3000, opp_score=0, remaining_moves=300)
+    assert d != 'left'
+
+
+def test_v8_candidato_en_zona_queda_marcado_y_sin_espacio():
+    g = _grid(7, 7)
+    g[3][1] = SMALL
+    g[3][3] = 'A'
+    board = Board(_board_str(g), 'A', '7x7')
+    cands = SnakeStrategy()._build_candidates(board, my_score=800)
+    assert cands['left']['bomb_hit'] is True
+    assert cands['left']['space'] == 0
+    assert cands['left']['penalty'] == 800
+    assert cands['right']['bomb_hit'] is False and cands['right']['penalty'] == 0
+
+
+def test_v8_rodea_la_bomba_para_llegar_a_la_comida():
+    # La comida esta del otro lado de una 🧨: el camino recto pasa por su
+    # zona. Ningun paso del camino elegido entra a la zona.
+    g = _grid(9, 9)
+    g[4][1] = 'A'
+    g[4][4] = SMALL
+    g[4][7] = '*'
+    s = SnakeStrategy()
+    board_str = _board_str(g)
+    for _ in range(20):
+        b = Board(board_str, 'A', '9x9')
+        d = s.choose_direction(board_str, 'A', board_size='9x9', my_score=500,
+                               opp_score=0, remaining_moves=300)
+        dr, dc = DIRECTIONS[d]
+        nxt = (b.head[0] + dr, b.head[1] + dc)
+        assert nxt not in b.bomb_zone
+        if nxt == (4, 7):
+            break
+        g[b.head[0]][b.head[1]] = '.'
+        g[nxt[0]][nxt[1]] = 'A'
+        board_str = _board_str(g)
+    else:
+        raise AssertionError('no llego a la comida')
+
+
+def test_v8_ultimo_recurso_prefiere_bomba_antes_que_chocar_el_muro():
+    # A en (2,1): izquierda es muro (choque: pierdo puntaje Y la cola),
+    # arriba es el rival, derecha mi cuerpo. La unica otra salida (abajo)
+    # cae en la zona de una 🧨 (pierdo solo el puntaje, que es poco).
+    rows = ['......',
+            '.bbb..',
+            '#Aaaa.',
+            '..' + SMALL + '...',
+            '......']
+    board_str = make_board_str(rows)
+    b = Board(board_str, 'A', '5x6')
+    assert (3, 1) in b.bomb_zone
+    d = SnakeStrategy().choose_direction(board_str, 'A', board_size='5x6',
+                                         my_score=100, opp_score=0, remaining_moves=300)
+    assert d == 'down'
+
+
+def test_v8_no_espera_al_siguiente_digito_dentro_de_una_zona():
+    # Como test_espera_al_lado_del_siguiente_sin_pisarlo, pero tres 🧨
+    # tapan todas las celdas vecinas del 2 (sin tocar el 2, como en el
+    # juego real): no hay donde esperar.
+    rows = [SMALL + '.........',
+            '......A...',
+            '2.' + SMALL + '.......',
+            '..........',
+            SMALL + '......1B.',
+            '..........']
+    board = Board(make_board_str(rows), 'A', '6x10')
+    assert (2, 0) not in board.bomb_zone
+    assert {(1, 0), (3, 0), (2, 1)} <= board.bomb_zone
+    s = SnakeStrategy()
+    assert s._plan_siguiente_digito(board, s._build_candidates(board), 0, None) is None
+
+
+def test_v8_costo_de_bomba():
+    assert SnakeStrategy._bomb_cost(2500) == 2500
+    assert SnakeStrategy._bomb_cost(0) == FIXED_PENALTY
+    assert SnakeStrategy._bomb_cost(-300) == FIXED_PENALTY
+    assert SnakeStrategy._bomb_cost(None) == FIXED_PENALTY
+
+
+def test_v8_tablero_30x30_con_bombas_decide_rapido():
+    import time
+    g = _grid(30, 30)
+    # Vibora larga en serpentina.
+    body = [(r, c) for r in range(2, 12) for c in (range(2, 26) if r % 2 == 0 else range(25, 1, -1))]
+    for r, c in body[1:]:
+        g[r][c] = 'a'
+    g[body[0][0]][body[0][1]] = 'A'
+    for r, c in [(20, 5), (25, 25)]:
+        g[r][c] = BIG
+    for r, c in [(15, 15), (18, 28), (28, 2), (14, 1), (27, 14)]:
+        g[r][c] = SMALL
+    g[22][22] = 'B'
+    for pos, v in [((17, 10), '3'), ((26, 20), '4'), ((13, 27), '5'), ((29, 29), '6'), ((16, 4), '7')]:
+        g[pos[0]][pos[1]] = v
+    g[19][19] = 'X'
+    start = time.perf_counter()
+    d = SnakeStrategy().choose_direction(_board_str(g), 'A', board_size='30x30', next_digit=3,
+                                         my_score=1000, opp_score=500, remaining_moves=350,
+                                         my_multiplier=2, opp_multiplier=2)
+    assert d in DIRECTIONS
+    assert time.perf_counter() - start < 0.5
+
+
+# -- partida my_match 12: carrera contra CUALQUIER copia del objetivo -------
+TURNO_207_M12 = (
+    '| 7                  |\n'
+    '|       7   1  7     |\n'
+    '|        9           |\n'
+    '|             2      |\n'
+    '|                    |\n'
+    '|                    |\n'
+    '|                    |\n'
+    '|    7             8 |\n'
+    '|#  8 9       b      |\n'
+    '|#        Bbbbbb    X|\n'
+    '|#        bb8bbb     |\n'
+    '|            9       |\n'
+    '|            2   a   |\n'
+    '|               aa   |\n'
+    '| X            aa   2|\n'
+    '|         1    aaa   |\n'
+    '|              1 A   |\n'
+    '|       2     8 7    |\n'
+    '|                    |\n'
+)
+
+
+def test_carrera_se_compara_contra_la_copia_mas_cercana_del_rival():
+    # Objetivo 7 con 5 copias. El rival (A) esta a 2 pasos de la copia de
+    # abajo; yo (B) estoy mas cerca que el de la copia de (7,4). Antes el
+    # bot iba a esa copia "ganada", pero el rival se come la suya y borra
+    # todas. Ahora la carrera esta perdida: no hay paso hacia el digito.
+    board = Board(TURNO_207_M12, 'B', '19x20')
+    assert board.target_digit == 7 and len(board.food) == 5
+    s = SnakeStrategy()
+    cands = s._build_candidates(board)
+    assert s._best_target_move(cands, board.food, 0) != (None, None)        # copia por copia
+    assert s._best_target_move(cands, board.food, 0, shared=True) == (None, None)
+
+
+# -- partida my_match 13: encerrar el digito que espero / X al principio ---
+TURNO_261_M13 = (
+    '|                    |\n'
+    '|9                   |\n'
+    '|                    |\n'
+    '| 4                  |\n'
+    '|3                   |\n'
+    '|                    |\n'
+    '|              2     |\n'
+    '| 31   2   114       |\n'
+    '|X          4        |\n'
+    '|                  X |\n'
+    '|         2          |\n'
+    '|  9              9  |\n'
+    '|                    |\n'
+    '|  A                 |\n'
+    '|  a      #          |\n'
+    '|  a         3       |\n'
+    '|aaa        4       2|\n'
+    '|a            Bbb    |\n'
+    '| 2            1b    |\n'
+    '|1         3  bbb    |\n'
+)
+
+
+def test_no_encierra_con_su_cuerpo_el_digito_que_espera():
+    # Esperando al 1 de abajo (18,14), bajar cierra con mi cuerpo la
+    # ultima entrada con salida: despues no se puede comer sin chocar.
+    board = Board(TURNO_261_M13, 'B', '20x20')
+    s = SnakeStrategy()
+    cands = s._build_candidates(board)
+    siguiente = s._next_digit_positions(board)
+    assert s._digit_stays_open(board, cands['down']['pos'], siguiente) is False
+    assert s._digit_stays_open(board, cands['left']['pos'], siguiente) is True
+    d = s.choose_direction(TURNO_261_M13, 'B', board_size='20x20', my_score=1965,
+                           opp_score=6711, remaining_moves=261,
+                           my_multiplier=1, opp_multiplier=6)
+    assert d != 'down'
+
+
+TURNO_393_M13 = (
+    '|            3  4    |\n'
+    '|                    |\n'
+    '|                    |\n'
+    '|  aaA       X       |\n'
+    '|                    |\n'
+    '|      1           2 |\n'
+    '| 1          3    4  |\n'
+    '|       3   3   3    |\n'
+    '|            1 #     |\n'
+    '|              #     |\n'
+    '|              #   4 |\n'
+    '|              #    5|\n'
+    '|     1        #5    |\n'
+    '|                    |\n'
+    '|                    |\n'
+    '|                    |\n'
+    '|   2            2   |\n'
+    '|               Bbb  |\n'
+    '|         5          |\n'
+    '|        X 5         |\n'
+)
+
+
+def test_al_principio_va_por_la_x_en_vez_de_esperar_un_digito_chico():
+    # Rem 393: el rival gana el 1 y el bot esperaba al 2 (200 puntos a
+    # x1) con un 'X' a 9 pasos. Un escalon de multiplicador con toda la
+    # partida por delante rinde mucho mas: va hacia el 'X' (izquierda).
+    board = Board(TURNO_393_M13, 'B', '20x20')
+    s = SnakeStrategy()
+    assert s._x_gain(board, 393) >= 5 * 200
+    d = s.choose_direction(TURNO_393_M13, 'B', board_size='20x20', my_score=3,
+                           opp_score=4, remaining_moves=393,
+                           my_multiplier=1, opp_multiplier=1)
+    assert d == 'left'
+
+
+# -- partida my_match 14: encierro al acercarse / encadenar digitos -------
+TURNO_285_M14 = (
+    '|6    22           |\n'
+    '|    3             |\n'
+    '| X     5    4     |\n'
+    '|                  |\n'
+    '|         3        |\n'
+    '|   5              |\n'
+    '|     5    bbb     |\n'
+    '|          b2bb    |\n'
+    '|2         B  b    |\n'
+    '|             b    |\n'
+    '|    aa2           |\n'
+    '|3   a3  4         |\n'
+    '| 6  aA            |\n'
+    '|    aa     6X    4|\n'
+    '|       ###########|\n'
+    '|3          5      |\n'
+)
+
+
+def test_no_encierra_el_objetivo_al_acercarse():
+    # Rem 285: el 2 de (7,11) esta rodeado por mi cuerpo salvo por abajo.
+    # Ir a la derecha deja la cabeza en la unica entrada, pero comerlo
+    # despues es chocar (en la partida real perdi el 2 estando a 1 paso).
+    board = Board(TURNO_285_M14, 'B', '16x18')
+    s = SnakeStrategy()
+    cands = s._build_candidates(board)
+    assert s._digit_stays_open(board, cands['right']['pos'], board.food) is False
+    d = s.choose_direction(TURNO_285_M14, 'B', board_size='16x18', my_score=8898,
+                           opp_score=7999, remaining_moves=285,
+                           my_multiplier=4, opp_multiplier=6)
+    assert d != 'right'
+
+
+def test_entre_dos_copias_elige_la_que_queda_cerca_del_siguiente():
+    # El 3 de la izquierda esta a 3 pasos; el de la derecha a 5, pero con
+    # el 4 pegado. Como el desvio (2) entra en CHAIN_SLACK, va a la
+    # derecha: come el 3 y queda al lado del 4. Sin encadenar iria a la
+    # izquierda.
+    rows = ['..............',
+            '..............',
+            '...3..A....34.',
+            '..............',
+            '..............',
+            '5............B',
+            '6.....7.......']
+    s = SnakeStrategy()
+    d = s.choose_direction(make_board_str(rows), 'A', board_size='7x14', next_digit=3,
+                           my_score=0, opp_score=0, remaining_moves=300)
+    assert d == 'right'
+
+
+def test_encadenar_no_se_desvia_mas_de_chain_slack():
+    # La copia con el 4 al lado queda 6 pasos mas lejos que la otra: no
+    # vale el desvio, va a la cercana (izquierda).
+    rows = ['..................',
+            '....3.A.........34',
+            '..................',
+            '5................B',
+            '6.......7.........']
+    s = SnakeStrategy()
+    d = s.choose_direction(make_board_str(rows), 'A', board_size='5x18', next_digit=3,
+                           my_score=0, opp_score=0, remaining_moves=300)
+    assert d == 'left'
+
+
+# -- partida my_match 15: pasillo cuya unica salida es un digito equivocado -
+TURNO_97_M15 = (
+    '|         3  5 |\n'
+    '|   6        X |\n'
+    '|5 aaaaa     X |\n'
+    '| aa       6  #|\n'
+    '| aaaaaa      #|\n'
+    '| Baaaaa4     #|\n'
+    '|5ba  aa7     #|\n'
+    '| baaa4A      #|\n'
+    '|6baaaaa   7  #|\n'
+    '| b           #|\n'
+    '| bbb  bb     #|\n'
+    '|37 bbbbb4    #|\n'
+    '|   7 63b      |\n'
+    '|       b   6  |\n'
+)
+
+
+def test_espacio_limpio_detecta_el_pasillo_sin_salida():
+    # Rem 97: el bot sube por un pasillo entre el borde y el cuerpo del
+    # rival. Contando los digitos equivocados como libres hay 138 celdas;
+    # sin pisarlos, 3. Con 17 de cuerpo, ese paso no es seguro.
+    board = Board(TURNO_97_M15, 'B', '14x14')
+    s = SnakeStrategy()
+    cands = s._build_candidates(board)
+    izq = cands['left']
+    assert izq['space'] > 100 and izq['clean_space'] <= 3
+    assert s._is_safe(izq) is False
+
+
+def test_is_safe_sin_clean_space_usa_el_espacio_total():
+    s = SnakeStrategy()
+    assert s._is_safe({'space': 10, 'body_len': 5}) is True
+    assert s._is_safe({'space': 4, 'body_len': 5}) is False
+    assert s._is_safe({'space': 10, 'clean_space': 2, 'body_len': 5}) is False

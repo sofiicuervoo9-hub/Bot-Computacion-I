@@ -489,3 +489,69 @@ def test_main_con_token_arranca_el_bot(monkeypatch, tmp_path):
 
     import runpy
     runpy.run_module('run', run_name='__main__')  # ejecuta SnakeBot(...) + asyncio.run(bot.run())
+
+
+# -- v7/v8: simbolos no ASCII en la consola de Windows ---------------------
+
+import io  # noqa: E402
+
+from run import safe_print  # noqa: E402
+
+TABLERO_V8 = '|A..\U0001F4A3|\n|.Ⓐ.\U0001F9E8|\n|..bB|'
+
+
+def _consola_windows(monkeypatch):
+    """stdout con encoding cp1252, como la consola de Windows."""
+    buf = io.BytesIO()
+    monkeypatch.setattr(sys, 'stdout', io.TextIOWrapper(buf, encoding='cp1252'))
+    return buf
+
+
+def test_safe_print_no_rompe_con_emojis_en_cp1252(monkeypatch):
+    buf = _consola_windows(monkeypatch)
+    safe_print(TABLERO_V8)  # un print() comun tiraria UnicodeEncodeError
+    sys.stdout.flush()
+    assert b'\\U0001f4a3' in buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_process_turn_con_bombas_en_consola_windows_igual_responde(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _consola_windows(monkeypatch)
+    bot = make_bot(FakeStrategy(direction='down'))
+    ws = FakeWebSocket()
+    data = {
+        'side': 'A', 'board': TABLERO_V8, 'board_size': '3x4',
+        'game_id': 'g12', 'turn_token': 't1',
+        'score_1': 0, 'score_2': 0, 'remaining_moves': 400,
+    }
+    await bot._process_turn(ws, {'data': data})
+    assert json.loads(ws.sent[0])['data']['direction'] == 'down'
+
+
+@pytest.mark.asyncio
+async def test_play_mensaje_con_surrogates_llega_entero_a_la_estrategia(tmp_path, monkeypatch):
+    # El server manda las bombas como "💣": json.loads las junta
+    # en un solo caracter, y el tablero llega con una celda por bomba.
+    monkeypatch.chdir(tmp_path)
+    _consola_windows(monkeypatch)
+    strategy = FakeStrategy(direction='up')
+    bot = make_bot(strategy)
+    raw = ('{"event": "your_turn", "data": {"side": "A", '
+           '"board": "|A..\\ud83d\\udca3|\\n|.\\u24b6.\\ud83e\\udde8|\\n|..bB|", '
+           '"board_size": "3x4", "game_id": "g13", "turn_token": "t1", '
+           '"score_1": 0, "score_2": 0, "remaining_moves": 400}}')
+    await bot._play(FakeWebSocket(incoming=[raw]))
+    board_str = strategy.calls[0][0][0]
+    assert board_str == TABLERO_V8
+    assert all(len(row) == 6 for row in board_str.split('\n'))   # 4 celdas + 2 '|'
+
+
+def test_game_logger_escribe_en_utf8(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    logger = GameLogger()
+    logger.log_event('g14', {'event': 'your_turn', 'data': {'board': TABLERO_V8}})
+    logger.write('g14')
+    contenido = (tmp_path / 'game_g14.log').read_text(encoding='utf-8')
+    linea = contenido.strip()
+    assert json.loads(linea[linea.index('{'):])['data']['board'] == TABLERO_V8
