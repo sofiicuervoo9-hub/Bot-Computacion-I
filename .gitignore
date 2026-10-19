@@ -136,3 +136,6 @@ logs/
 
 
 simulador/*/
+
+# partidas guardadas para los tests (se suben aunque *.log este ignorado)
+!tests/fixtures/*.log

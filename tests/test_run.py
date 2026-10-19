@@ -1,81 +1,31 @@
-"""Tests unitarios de run.py (GameLogger y SnakeBot), con el websocket
-mockeado -- no abren conexion de red real."""
+"""Tests de run.py (GameLogger y SnakeBot) con el websocket simulado."""
 
+import contextlib
+import io
 import json
+import os
+import runpy
 import sys
+import tempfile
 import time
+import unittest
 from datetime import datetime
+from unittest import mock
 
-import pytest
 import websockets
 
-from run import GameLogger, SnakeBot
+from board import DIRECTIONS
+from run import SERVER_URL, GameLogger, SnakeBot, safe_print
+from snake_ai import SnakeStrategy
+
+BOARD_V8 = '|A..\U0001f4a3|\n|.Ⓐ.\U0001f9e8|\n|..bB|'
 
 
-# -- GameLogger --------------------------------------------------------
+# -- dobles de prueba --------------------------------------------------
 
-def test_game_logger_log_event_y_log_action(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    logger = GameLogger()
-    logger.log_event('g1', {'event': 'your_turn', 'data': {'x': 1}})
-    logger.log_action('g1', {'action': 'move', 'data': {'direction': 'up'}})
-    assert len(logger._history['g1']) == 2
-    assert logger._history['g1'][0].startswith('< ')
-    assert logger._history['g1'][1].startswith('> ')
-
-
-def test_game_logger_write_crea_archivo_y_limpia_historial(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    logger = GameLogger()
-    logger.log_event('g2', {'event': 'game_over', 'data': {}})
-    logger.write('g2')
-    log_file = tmp_path / 'game_g2.log'
-    assert log_file.exists()
-    assert 'game_over' in log_file.read_text()
-    assert 'g2' not in logger._history
-
-
-def test_log_event_y_log_action_incluyen_timestamp_parseable():
-    logger = GameLogger()
-    logger.log_event('g1b', {'event': 'x'})
-    logger.log_action('g1b', {'action': 'move', 'data': {'direction': 'up'}})
-
-    for line, marker in zip(logger._history['g1b'], ['< [', '> [']):
-        assert line.startswith(marker)
-        closing = line.index(']')
-        timestamp_str = line[len(marker):closing]  # arranca justo despues del '['
-        datetime.fromisoformat(timestamp_str)  # no debe tirar excepcion
-        json_part = line[line.index('{'):]
-        json.loads(json_part)  # el JSON sigue siendo parseable igual
-
-
-def test_game_logger_write_sin_historial_previo(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    logger = GameLogger()
-    # nunca se llamo log_event/log_action para 'g3': igual debe poder
-    # escribir un archivo (vacio) sin romperse.
-    logger.write('g3')
-    assert (tmp_path / 'game_g3.log').exists()
-
-
-def test_game_logger_write_maneja_oserror(monkeypatch, capsys):
-    logger = GameLogger()
-    logger.log_event('g4', {'event': 'x'})
-
-    def boom(*args, **kwargs):
-        raise OSError('disco lleno')
-
-    monkeypatch.setattr('builtins.open', boom)
-    logger.write('g4')  # no debe propagar la excepcion
-    out = capsys.readouterr().out
-    assert 'could not write game log' in out
-    assert 'g4' not in logger._history
-
-
-# -- SnakeBot: helpers --------------------------------------------------
 
 class FakeStrategy:
-    """Estrategia fake para no depender de SnakeStrategy real en estos tests."""
+    """Estrategia falsa que devuelve siempre la misma direccion."""
 
     def __init__(self, direction='up', raise_error=False):
         self.direction = direction
@@ -90,8 +40,7 @@ class FakeStrategy:
 
 
 class SlowStrategy:
-    """Estrategia fake que tarda mas de la cuenta, para probar el limite
-    de tiempo duro (_choose_direction_con_limite)."""
+    """Estrategia falsa que tarda mas de la cuenta."""
 
     def __init__(self, delay_seconds):
         self.delay_seconds = delay_seconds
@@ -102,8 +51,7 @@ class SlowStrategy:
 
 
 class FakeWebSocket:
-    """Simula una conexion websocket: guarda lo enviado y devuelve una
-    cola de mensajes predefinida en .recv()."""
+    """Websocket falso: guarda lo enviado y devuelve mensajes de una cola."""
 
     def __init__(self, incoming=None):
         self.sent = []
@@ -118,440 +66,439 @@ class FakeWebSocket:
         return self._incoming.pop(0)
 
 
+def fake_connect(on_enter, on_init=None):
+    """Clase que reemplaza websockets.connect; on_enter decide que pasa al
+    conectar."""
+
+    class FakeConnect:
+        def __init__(self, uri):
+            if on_init is not None:
+                on_init(uri)
+
+        async def __aenter__(self):
+            return on_enter()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    return FakeConnect
+
+
+def interrupt():
+    raise KeyboardInterrupt()
+
+
+async def fake_sleep(_):
+    return None
+
+
 def make_bot(strategy=None):
     return SnakeBot('fake-token', strategy=strategy or FakeStrategy())
 
 
-# -- SnakeBot.__init__ / _send -------------------------------------------
-
-def test_snake_bot_init_usa_strategy_por_defecto():
-    bot = SnakeBot('tok')
-    assert bot.auth_token == 'tok'
-    assert 'tok' in bot.uri
-    assert bot.strategy is not None
-
-
-@pytest.mark.asyncio
-async def test_send_manda_json_por_el_websocket():
-    bot = make_bot()
-    ws = FakeWebSocket()
-    await bot._send(ws, 'move', {'direction': 'up'})
-    assert len(ws.sent) == 1
-    sent = json.loads(ws.sent[0])
-    assert sent == {'action': 'move', 'data': {'direction': 'up'}}
-
-
-# -- SnakeBot._handle -----------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_handle_challenge_acepta():
-    bot = make_bot()
-    ws = FakeWebSocket()
-    await bot._handle(ws, {'event': 'challenge', 'data': {'challenge_id': 'c_1'}})
-    sent = json.loads(ws.sent[0])
-    assert sent == {'action': 'accept_challenge', 'data': {'challenge_id': 'c_1'}}
-
-
-@pytest.mark.asyncio
-async def test_handle_game_over_escribe_log(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    bot = make_bot()
-    ws = FakeWebSocket()
-    await bot._handle(ws, {'event': 'game_over', 'data': {'game_id': 'g9'}})
-    assert (tmp_path / 'game_g9.log').exists()
-
-
-@pytest.mark.asyncio
-async def test_handle_game_over_sin_game_id_no_rompe():
-    bot = make_bot()
-    ws = FakeWebSocket()
-    await bot._handle(ws, {'event': 'game_over', 'data': {}})  # no explota
-
-
-@pytest.mark.asyncio
-async def test_handle_error_solo_imprime(capsys):
-    bot = make_bot()
-    ws = FakeWebSocket()
-    await bot._handle(ws, {'event': 'error', 'data': {'Error': 'boom'}})
-    assert 'server reported an error' in capsys.readouterr().out
-
-
-@pytest.mark.asyncio
-async def test_handle_evento_desconocido_no_hace_nada():
-    bot = make_bot()
-    ws = FakeWebSocket()
-    await bot._handle(ws, {'event': 'list_users', 'data': {'users': []}})  # no explota
-
-
-@pytest.mark.asyncio
-async def test_handle_your_turn_llama_a_process_turn(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    strategy = FakeStrategy(direction='right')
-    bot = make_bot(strategy)
-    ws = FakeWebSocket()
+def make_turn_data(game_id, side='A', **extra):
     data = {
-        'side': 'A', 'board': '|...|', 'board_size': '1x3',
-        'game_id': 'g5', 'turn_token': 't1',
-        'score_1': 3, 'score_2': 1, 'remaining_moves': 50,
+        'side': side,
+        'board': '|...|',
+        'board_size': '1x3',
+        'game_id': game_id,
+        'turn_token': 't1',
+        'score_1': 0,
+        'score_2': 0,
+        'remaining_moves': 20,
     }
-    await bot._handle(ws, {'event': 'your_turn', 'data': data})
-    sent = json.loads(ws.sent[0])
-    assert sent['data']['direction'] == 'right'
-    assert sent['data']['game_id'] == 'g5'
-    assert len(strategy.calls) == 1
+    data.update(extra)
+    return data
+
+
+class BotTestCase(unittest.IsolatedAsyncioTestCase):
+    """Cada test corre en una carpeta temporal y puede capturar la consola."""
+
+    def setUp(self):
+        self._previous_dir = os.getcwd()
+        self._folder = tempfile.TemporaryDirectory()
+        os.chdir(self._folder.name)
+
+    def tearDown(self):
+        os.chdir(self._previous_dir)
+        self._folder.cleanup()
+
+    @staticmethod
+    def capture():
+        """Context manager que junta lo impreso en un StringIO."""
+        return contextlib.redirect_stdout(io.StringIO())
+
+    @staticmethod
+    def offline(connect_class):
+        """Reemplaza la conexion real y la espera entre reintentos."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch('run.asyncio.sleep', fake_sleep))
+        stack.enter_context(
+            mock.patch('run.websockets.connect', connect_class)
+        )
+        return stack
+
+    @staticmethod
+    def windows_console():
+        """Reemplaza stdout por uno cp1252, como la consola de Windows."""
+        buf = io.BytesIO()
+        wrapper = io.TextIOWrapper(buf, encoding='cp1252')
+        return buf, mock.patch.object(sys, 'stdout', wrapper)
+
+
+# -- GameLogger --------------------------------------------------------
+
+
+class GameLoggerTest(BotTestCase):
+    """Tests de GameLogger."""
+
+    def test_log_event_and_log_action(self):
+        logger = GameLogger()
+        logger.log_event('g1', {'event': 'your_turn', 'data': {'x': 1}})
+        logger.log_action(
+            'g1', {'action': 'move', 'data': {'direction': 'up'}}
+        )
+        history = logger._history['g1']
+        assert len(history) == 2
+        assert history[0].startswith('< ') and history[1].startswith('> ')
+
+    def test_write_creates_file_and_clears_history(self):
+        logger = GameLogger()
+        logger.log_event('g2', {'event': 'game_over', 'data': {}})
+        logger.write('g2')
+        with open('game_g2.log', encoding='utf-8') as f:
+            assert 'game_over' in f.read()
+        assert 'g2' not in logger._history
+
+    def test_log_lines_include_parseable_timestamp(self):
+        logger = GameLogger()
+        logger.log_event('g1b', {'event': 'x'})
+        logger.log_action(
+            'g1b', {'action': 'move', 'data': {'direction': 'up'}}
+        )
+        for line, marker in zip(logger._history['g1b'], ['< [', '> [']):
+            assert line.startswith(marker)
+            stamp_end, json_start = line.index(']'), line.index('{')
+            datetime.fromisoformat(line[len(marker):stamp_end])
+            json.loads(line[json_start:])
+
+    def test_write_without_history(self):
+        GameLogger().write('g3')
+        assert os.path.exists('game_g3.log')
+
+    def test_write_handles_oserror(self):
+        logger = GameLogger()
+        logger.log_event('g4', {'event': 'x'})
+        with mock.patch('builtins.open', side_effect=OSError('disco lleno')):
+            with self.capture() as out:
+                logger.write('g4')
+        assert 'could not write game log' in out.getvalue()
+        assert 'g4' not in logger._history
+
+    def test_writes_utf8(self):
+        logger = GameLogger()
+        logger.log_event(
+            'g14', {'event': 'your_turn', 'data': {'board': BOARD_V8}}
+        )
+        logger.write('g14')
+        with open('game_g14.log', encoding='utf-8') as f:
+            line = f.read().strip()
+        json_start = line.index('{')
+        assert json.loads(line[json_start:])['data']['board'] == BOARD_V8
+
+
+# -- SnakeBot: estrategias, envio y eventos -----------------------------
+
+
+class SnakeBotTest(BotTestCase):
+    """Tests de SnakeBot sin conexion real."""
+
+    def test_init_keeps_token_in_uri(self):
+        bot = SnakeBot('tok')
+        assert bot.auth_token == 'tok'
+        assert 'tok' in bot.uri
+
+    def test_without_strategy_uses_one_per_game(self):
+        bot = SnakeBot('tok')
+        first = bot.strategy_for('g1')
+        assert isinstance(first, SnakeStrategy)
+        assert bot.strategy_for('g1') is first
+        assert bot.strategy_for('g2') is not first
+
+    def test_fixed_strategy_is_shared_by_all_games(self):
+        strategy = FakeStrategy()
+        bot = make_bot(strategy)
+        assert bot.strategy_for('g1') is strategy
+        assert bot.strategy_for('g2') is strategy
+
+    async def test_game_over_discards_that_games_strategy(self):
+        bot = SnakeBot('tok')
+        first = bot.strategy_for('g1')
+        await bot._handle(
+            FakeWebSocket(), {'event': 'game_over', 'data': {'game_id': 'g1'}}
+        )
+        assert bot.strategy_for('g1') is not first
+
+    async def test_send_writes_json_to_websocket(self):
+        ws = FakeWebSocket()
+        with self.capture():
+            await make_bot()._send(ws, 'move', {'direction': 'up'})
+        assert len(ws.sent) == 1
+        expected = {'action': 'move', 'data': {'direction': 'up'}}
+        assert json.loads(ws.sent[0]) == expected
+
+    async def test_handle_challenge_accepts(self):
+        ws = FakeWebSocket()
+        event = {'event': 'challenge', 'data': {'challenge_id': 'c_1'}}
+        with self.capture():
+            await make_bot()._handle(ws, event)
+        expected = {
+            'action': 'accept_challenge',
+            'data': {'challenge_id': 'c_1'},
+        }
+        assert json.loads(ws.sent[0]) == expected
+
+    async def test_handle_game_over_writes_log(self):
+        event = {'event': 'game_over', 'data': {'game_id': 'g9'}}
+        with self.capture():
+            await make_bot()._handle(FakeWebSocket(), event)
+        assert os.path.exists('game_g9.log')
+
+    async def test_handle_game_over_without_game_id_does_not_break(self):
+        event = {'event': 'game_over', 'data': {}}
+        await make_bot()._handle(FakeWebSocket(), event)
+
+    async def test_handle_error_only_prints(self):
+        event = {'event': 'error', 'data': {'Error': 'boom'}}
+        with self.capture() as out:
+            await make_bot()._handle(FakeWebSocket(), event)
+        assert 'server reported an error' in out.getvalue()
+
+    async def test_handle_unknown_event_does_nothing(self):
+        event = {'event': 'list_users', 'data': {'users': []}}
+        await make_bot()._handle(FakeWebSocket(), event)
+
+    async def test_handle_your_turn_calls_process_turn(self):
+        strategy = FakeStrategy(direction='right')
+        ws = FakeWebSocket()
+        data = make_turn_data('g5', score_1=3, score_2=1, remaining_moves=50)
+        with self.capture():
+            await make_bot(strategy)._handle(
+                ws, {'event': 'your_turn', 'data': data}
+            )
+        sent = json.loads(ws.sent[0])
+        assert sent['data']['direction'] == 'right'
+        assert sent['data']['game_id'] == 'g5'
+        assert len(strategy.calls) == 1
 
 
 # -- SnakeBot._process_turn -------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_process_turn_side_a_usa_score_1_como_mio():
-    strategy = FakeStrategy(direction='down')
-    bot = make_bot(strategy)
-    ws = FakeWebSocket()
-    data = {
-        'side': 'A', 'board': '|...|', 'board_size': '1x3',
-        'game_id': 'g6', 'turn_token': 't1',
-        'score_1': 10, 'score_2': 4, 'remaining_moves': 20,
-    }
-    await bot._process_turn(ws, {'data': data})
-    (_, kwargs) = strategy.calls[0]
-    # llamado posicional: (board_str, side, board_size, next_digit, my_score, opp_score, remaining_moves)
-    args = strategy.calls[0][0]
-    assert args[4] == 10  # my_score
-    assert args[5] == 4   # opp_score
+
+class ProcessTurnTest(BotTestCase):
+    """Que datos le llegan a la estrategia en cada turno."""
+
+    async def strategy_kwargs(self, data):
+        """Corre un turno con una estrategia falsa y devuelve sus kwargs."""
+        strategy = FakeStrategy(direction='down')
+        with self.capture():
+            await make_bot(strategy)._process_turn(
+                FakeWebSocket(), {'data': data}
+            )
+        return strategy.calls[0][1]
+
+    async def test_side_a_uses_score_1_as_mine(self):
+        kwargs = await self.strategy_kwargs(
+            make_turn_data('g6', score_1=10, score_2=4)
+        )
+        assert (kwargs['my_score'], kwargs['opp_score']) == (10, 4)
+
+    async def test_side_b_uses_score_2_as_mine(self):
+        kwargs = await self.strategy_kwargs(
+            make_turn_data('g7', side='B', score_1=10, score_2=4)
+        )
+        assert (kwargs['my_score'], kwargs['opp_score']) == (4, 10)
+
+    async def test_does_not_use_next_digit(self):
+        # El servidor no manda next_digit: el objetivo sale del tablero.
+        kwargs = await self.strategy_kwargs(make_turn_data('g8', next_digit=7))
+        assert 'next_digit' not in kwargs
+
+    async def test_side_a_uses_multiplier_1_as_mine(self):
+        kwargs = await self.strategy_kwargs(
+            make_turn_data('g6b', multiplier_1=3, multiplier_2=1)
+        )
+        mults = (kwargs['my_multiplier'], kwargs['opp_multiplier'])
+        assert mults == (3, 1)
+
+    async def test_side_b_uses_multiplier_2_as_mine(self):
+        kwargs = await self.strategy_kwargs(
+            make_turn_data('g7b', side='B', multiplier_1=3, multiplier_2=1)
+        )
+        mults = (kwargs['my_multiplier'], kwargs['opp_multiplier'])
+        assert mults == (1, 3)
+
+    async def test_without_multiplier_passes_none(self):
+        kwargs = await self.strategy_kwargs(make_turn_data('g6c'))
+        mults = (kwargs['my_multiplier'], kwargs['opp_multiplier'])
+        assert mults == (None, None)
+
+    async def test_broken_strategy_uses_random_direction(self):
+        ws = FakeWebSocket()
+        with self.capture():
+            await make_bot(FakeStrategy(raise_error=True))._process_turn(
+                ws, {'data': make_turn_data('g9')}
+            )
+        assert json.loads(ws.sent[0])['data']['direction'] in DIRECTIONS
+
+    async def test_prints_decision_time(self):
+        with self.capture() as out:
+            await make_bot(FakeStrategy(direction='up'))._process_turn(
+                FakeWebSocket(), {'data': make_turn_data('g11')}
+            )
+        assert 'decision: up in' in out.getvalue()
+
+    async def test_with_bombs_in_windows_console_still_answers(self):
+        ws = FakeWebSocket()
+        data = make_turn_data(
+            'g12', board=BOARD_V8, board_size='3x4', remaining_moves=400
+        )
+        _, console = self.windows_console()
+        with console:
+            await make_bot(FakeStrategy(direction='down'))._process_turn(
+                ws, {'data': data}
+            )
+        assert json.loads(ws.sent[0])['data']['direction'] == 'down'
 
 
-@pytest.mark.asyncio
-async def test_process_turn_side_b_usa_score_2_como_mio():
-    strategy = FakeStrategy(direction='down')
-    bot = make_bot(strategy)
-    ws = FakeWebSocket()
-    data = {
-        'side': 'B', 'board': '|...|', 'board_size': '1x3',
-        'game_id': 'g7', 'turn_token': 't1',
-        'score_1': 10, 'score_2': 4, 'remaining_moves': 20,
-    }
-    await bot._process_turn(ws, {'data': data})
-    args = strategy.calls[0][0]
-    assert args[4] == 4    # my_score (soy side B -> score_2)
-    assert args[5] == 10   # opp_score
+# -- limite de tiempo -----------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_process_turn_next_digit_se_pasa_a_la_estrategia():
-    strategy = FakeStrategy(direction='up')
-    bot = make_bot(strategy)
-    ws = FakeWebSocket()
-    data = {
-        'side': 'A', 'board': '|...|', 'board_size': '1x3', 'next_digit': 7,
-        'game_id': 'g8', 'turn_token': 't1',
-        'score_1': 0, 'score_2': 0, 'remaining_moves': 20,
-    }
-    await bot._process_turn(ws, {'data': data})
-    args = strategy.calls[0][0]
-    assert args[3] == 7  # next_digit
+class TimeoutTest(BotTestCase):
+    """Tests de _choose_direction_with_timeout."""
+
+    def test_normal_path(self):
+        bot = make_bot(FakeStrategy(direction='right'))
+        d = bot._choose_direction_with_timeout(
+            bot.strategy, '|...|', 'A', board_size='1x3'
+        )
+        assert d == 'right'
+
+    def test_cuts_on_timeout(self):
+        bot = SnakeBot(
+            'tok',
+            strategy=SlowStrategy(delay_seconds=0.3),
+            decision_timeout=0.05,
+        )
+        with self.capture() as out:
+            d = bot._choose_direction_with_timeout(
+                bot.strategy, '|...|', 'A', board_size='1x3'
+            )
+        assert d in DIRECTIONS
+        assert 'WARNING' in out.getvalue()
 
 
-@pytest.mark.asyncio
-async def test_process_turn_side_a_usa_multiplier_1_como_mio():
-    strategy = FakeStrategy(direction='down')
-    bot = make_bot(strategy)
-    ws = FakeWebSocket()
-    data = {
-        'side': 'A', 'board': '|...|', 'board_size': '1x3',
-        'game_id': 'g6b', 'turn_token': 't1',
-        'score_1': 10, 'score_2': 4, 'remaining_moves': 20,
-        'multiplier_1': 3, 'multiplier_2': 1,
-    }
-    await bot._process_turn(ws, {'data': data})
-    args = strategy.calls[0][0]
-    assert args[7] == 3  # my_multiplier
-    assert args[8] == 1  # opp_multiplier
+# -- SnakeBot._play y run --------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_process_turn_side_b_usa_multiplier_2_como_mio():
-    strategy = FakeStrategy(direction='down')
-    bot = make_bot(strategy)
-    ws = FakeWebSocket()
-    data = {
-        'side': 'B', 'board': '|...|', 'board_size': '1x3',
-        'game_id': 'g7b', 'turn_token': 't1',
-        'score_1': 10, 'score_2': 4, 'remaining_moves': 20,
-        'multiplier_1': 3, 'multiplier_2': 1,
-    }
-    await bot._process_turn(ws, {'data': data})
-    args = strategy.calls[0][0]
-    assert args[7] == 1  # my_multiplier (soy side B -> multiplier_2)
-    assert args[8] == 3  # opp_multiplier
+class ConnectionTest(BotTestCase):
+    """Tests del loop de mensajes y de la conexion."""
 
+    async def test_play_handles_messages_until_connection_closes(self):
+        message = json.dumps(
+            {'event': 'your_turn', 'data': make_turn_data('g10')}
+        )
+        ws = FakeWebSocket(incoming=[message])
+        with self.capture():
+            await make_bot(FakeStrategy(direction='left'))._play(ws)
+        assert len(ws.sent) == 1
 
-@pytest.mark.asyncio
-async def test_process_turn_sin_multiplicador_pasa_none():
-    # Partidas anteriores al 16/9/2026 no traen multiplier_1/2 -- no
-    # debe romper, simplemente se pasa None.
-    strategy = FakeStrategy(direction='down')
-    bot = make_bot(strategy)
-    ws = FakeWebSocket()
-    data = {
-        'side': 'A', 'board': '|...|', 'board_size': '1x3',
-        'game_id': 'g6c', 'turn_token': 't1',
-        'score_1': 0, 'score_2': 0, 'remaining_moves': 20,
-    }
-    await bot._process_turn(ws, {'data': data})
-    args = strategy.calls[0][0]
-    assert args[7] is None
-    assert args[8] is None
+    async def test_play_invalid_message_does_not_break_loop(self):
+        with self.capture() as out:
+            await make_bot()._play(FakeWebSocket(incoming=['no es json']))
+        assert 'error handling message' in out.getvalue()
 
+    async def test_play_message_with_surrogates_reaches_strategy_whole(self):
+        # json.loads junta cada par de surrogates en un solo caracter.
+        strategy = FakeStrategy(direction='up')
+        raw = (
+            '{"event": "your_turn", "data": {"side": "A", '
+            '"board": "|A..\\ud83d\\udca3|\\n|.\\u24b6.\\ud83e\\udde8|'
+            '\\n|..bB|", "board_size": "3x4", "game_id": "g13", '
+            '"turn_token": "t1", "score_1": 0, "score_2": 0, '
+            '"remaining_moves": 400}}'
+        )
+        _, console = self.windows_console()
+        with console:
+            await make_bot(strategy)._play(FakeWebSocket(incoming=[raw]))
+        board_str = strategy.calls[0][0][0]
+        assert board_str == BOARD_V8
+        assert all(len(row) == 6 for row in board_str.split('\n'))
 
-@pytest.mark.asyncio
-async def test_process_turn_estrategia_rota_usa_direccion_al_azar():
-    strategy = FakeStrategy(raise_error=True)
-    bot = make_bot(strategy)
-    ws = FakeWebSocket()
-    data = {
-        'side': 'A', 'board': '|...|', 'board_size': '1x3',
-        'game_id': 'g9', 'turn_token': 't1',
-        'score_1': 0, 'score_2': 0, 'remaining_moves': 20,
-    }
-    await bot._process_turn(ws, {'data': data})
-    sent = json.loads(ws.sent[0])
-    from board import DIRECTIONS
-    assert sent['data']['direction'] in DIRECTIONS
+    async def test_run_does_not_print_the_token(self):
+        def check_uri(uri):
+            assert 'token-secreto' in uri
 
+        bot = SnakeBot('token-secreto', strategy=FakeStrategy())
+        with self.offline(fake_connect(interrupt, check_uri)):
+            with self.capture() as out:
+                await bot.run()
+        assert SERVER_URL in out.getvalue()
+        assert 'token-secreto' not in out.getvalue()
 
-# -- _choose_direction_con_limite (watchdog de timeout) ---------------------
+    async def test_run_exits_loop_on_keyboard_interrupt(self):
+        with self.offline(fake_connect(interrupt)), self.capture():
+            await make_bot().run()
 
-def test_choose_direction_con_limite_camino_normal():
-    bot = make_bot(FakeStrategy(direction='right'))
-    d = bot._choose_direction_con_limite('|...|', 'A', '1x3', None, 0, 0, 10)
-    assert d == 'right'
+    async def test_run_connects_and_plays(self):
+        ws = FakeWebSocket(incoming=[])
+        attempts = []
 
-
-def test_choose_direction_con_limite_corta_por_timeout(capsys):
-    bot = SnakeBot('tok', strategy=SlowStrategy(delay_seconds=0.3), decision_timeout=0.05)
-    d = bot._choose_direction_con_limite('|...|', 'A', '1x3', None, 0, 0, 10)
-    from board import DIRECTIONS
-    assert d in DIRECTIONS
-    assert 'AVISO' in capsys.readouterr().out
-
-
-@pytest.mark.asyncio
-async def test_process_turn_imprime_tiempo_de_decision(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
-    strategy = FakeStrategy(direction='up')
-    bot = make_bot(strategy)
-    ws = FakeWebSocket()
-    data = {
-        'side': 'A', 'board': '|...|', 'board_size': '1x3',
-        'game_id': 'g11', 'turn_token': 't1',
-        'score_1': 0, 'score_2': 0, 'remaining_moves': 20,
-    }
-    await bot._process_turn(ws, {'data': data})
-    assert 'decision: up en' in capsys.readouterr().out
-
-
-# -- SnakeBot._play ----------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_play_procesa_mensajes_hasta_conexion_cerrada(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    strategy = FakeStrategy(direction='left')
-    bot = make_bot(strategy)
-    your_turn_msg = json.dumps({
-        'event': 'your_turn',
-        'data': {
-            'side': 'A', 'board': '|...|', 'board_size': '1x3',
-            'game_id': 'g10', 'turn_token': 't1',
-            'score_1': 0, 'score_2': 0, 'remaining_moves': 20,
-        },
-    })
-    ws = FakeWebSocket(incoming=[your_turn_msg])
-    await bot._play(ws)  # deberia consumir el mensaje y salir al agotarse
-    assert len(ws.sent) == 1
-
-
-@pytest.mark.asyncio
-async def test_play_mensaje_invalido_no_rompe_el_loop(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
-    bot = make_bot()
-    ws = FakeWebSocket(incoming=['esto no es json'])
-    await bot._play(ws)
-    assert 'error handling message' in capsys.readouterr().out
-
-
-# -- SnakeBot.run --------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_run_sale_del_loop_con_keyboard_interrupt(monkeypatch):
-    bot = make_bot()
-
-    async def fake_sleep(_):
-        return None
-
-    class FakeConnect:
-        def __init__(self, uri):
-            pass
-
-        async def __aenter__(self):
+        def enter():
+            if len(attempts) == 1:
+                return ws
             raise KeyboardInterrupt()
 
-        async def __aexit__(self, *exc):
-            return False
+        with self.offline(fake_connect(enter, attempts.append)):
+            with self.capture():
+                await make_bot().run()
+        assert len(attempts) == 2
 
-    monkeypatch.setattr('run.asyncio.sleep', fake_sleep)
-    monkeypatch.setattr('run.websockets.connect', FakeConnect)
-    await bot.run()  # no debe colgarse ni propagar la excepcion
+    async def test_run_retries_after_connection_error(self):
+        attempts = []
 
-
-@pytest.mark.asyncio
-async def test_run_conecta_exitosamente_y_juega(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    bot = make_bot()
-    ws = FakeWebSocket(incoming=[])  # recv() cierra la conexion al toque
-    attempts = {'n': 0}
-
-    async def fake_sleep(_):
-        return None
-
-    class FakeConnect:
-        def __init__(self, uri):
-            attempts['n'] += 1
-
-        async def __aenter__(self):
-            if attempts['n'] == 1:
-                return ws  # primera vuelta: conecta y juega (linea 53-54)
-            raise KeyboardInterrupt()  # segunda vuelta: cortamos el loop
-
-        async def __aexit__(self, *exc):
-            return False
-
-    monkeypatch.setattr('run.asyncio.sleep', fake_sleep)
-    monkeypatch.setattr('run.websockets.connect', FakeConnect)
-    await bot.run()
-    assert attempts['n'] == 2
-
-
-@pytest.mark.asyncio
-async def test_run_reintenta_tras_error_de_conexion(monkeypatch):
-    bot = make_bot()
-    attempts = []
-
-    async def fake_sleep(_):
-        return None
-
-    class FakeConnect:
-        def __init__(self, uri):
-            attempts.append(uri)
-
-        async def __aenter__(self):
+        def enter():
             if len(attempts) < 2:
                 raise RuntimeError('no se pudo conectar')
             raise KeyboardInterrupt()
 
-        async def __aexit__(self, *exc):
-            return False
-
-    monkeypatch.setattr('run.asyncio.sleep', fake_sleep)
-    monkeypatch.setattr('run.websockets.connect', FakeConnect)
-    await bot.run()
-    assert len(attempts) == 2  # fallo una vez, reintento, despues corto con KeyboardInterrupt
+        with self.offline(fake_connect(enter, attempts.append)):
+            with self.capture():
+                await make_bot().run()
+        assert len(attempts) == 2
 
 
-# -- main / entrypoint ----------------------------------------------------
-
-def test_main_sin_token_imprime_ayuda(capsys, monkeypatch):
-    monkeypatch.setattr(sys, 'argv', ['run.py'])
-    import runpy
-    runpy.run_module('run', run_name='__main__')
-    assert 'please provide your auth_token' in capsys.readouterr().out
+# -- consola y main ---------------------------------------------------
 
 
-def test_main_con_token_arranca_el_bot(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, 'argv', ['run.py', 'mi-token-de-prueba'])
+class ConsoleAndMainTest(BotTestCase):
+    """safe_print y el punto de entrada de run.py."""
 
-    async def fake_sleep(_):
-        return None
+    def test_safe_print_does_not_break_with_emojis_in_cp1252(self):
+        buf, console = self.windows_console()
+        with console:
+            safe_print(BOARD_V8)
+            sys.stdout.flush()
+        assert b'\\U0001f4a3' in buf.getvalue()
 
-    class FakeConnect:
-        def __init__(self, uri):
-            pass
+    def test_main_without_token_prints_help(self):
+        with mock.patch.object(sys, 'argv', ['run.py']):
+            with self.capture() as out:
+                runpy.run_module('run', run_name='__main__')
+        assert 'please provide your auth_token' in out.getvalue()
 
-        async def __aenter__(self):
-            raise KeyboardInterrupt()  # corta el loop en la primera vuelta
-
-        async def __aexit__(self, *exc):
-            return False
-
-    monkeypatch.setattr('run.asyncio.sleep', fake_sleep)
-    monkeypatch.setattr('run.websockets.connect', FakeConnect)
-
-    import runpy
-    runpy.run_module('run', run_name='__main__')  # ejecuta SnakeBot(...) + asyncio.run(bot.run())
-
-
-# -- v7/v8: simbolos no ASCII en la consola de Windows ---------------------
-
-import io  # noqa: E402
-
-from run import safe_print  # noqa: E402
-
-TABLERO_V8 = '|A..\U0001F4A3|\n|.Ⓐ.\U0001F9E8|\n|..bB|'
-
-
-def _consola_windows(monkeypatch):
-    """stdout con encoding cp1252, como la consola de Windows."""
-    buf = io.BytesIO()
-    monkeypatch.setattr(sys, 'stdout', io.TextIOWrapper(buf, encoding='cp1252'))
-    return buf
-
-
-def test_safe_print_no_rompe_con_emojis_en_cp1252(monkeypatch):
-    buf = _consola_windows(monkeypatch)
-    safe_print(TABLERO_V8)  # un print() comun tiraria UnicodeEncodeError
-    sys.stdout.flush()
-    assert b'\\U0001f4a3' in buf.getvalue()
-
-
-@pytest.mark.asyncio
-async def test_process_turn_con_bombas_en_consola_windows_igual_responde(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    _consola_windows(monkeypatch)
-    bot = make_bot(FakeStrategy(direction='down'))
-    ws = FakeWebSocket()
-    data = {
-        'side': 'A', 'board': TABLERO_V8, 'board_size': '3x4',
-        'game_id': 'g12', 'turn_token': 't1',
-        'score_1': 0, 'score_2': 0, 'remaining_moves': 400,
-    }
-    await bot._process_turn(ws, {'data': data})
-    assert json.loads(ws.sent[0])['data']['direction'] == 'down'
-
-
-@pytest.mark.asyncio
-async def test_play_mensaje_con_surrogates_llega_entero_a_la_estrategia(tmp_path, monkeypatch):
-    # El server manda las bombas como "💣": json.loads las junta
-    # en un solo caracter, y el tablero llega con una celda por bomba.
-    monkeypatch.chdir(tmp_path)
-    _consola_windows(monkeypatch)
-    strategy = FakeStrategy(direction='up')
-    bot = make_bot(strategy)
-    raw = ('{"event": "your_turn", "data": {"side": "A", '
-           '"board": "|A..\\ud83d\\udca3|\\n|.\\u24b6.\\ud83e\\udde8|\\n|..bB|", '
-           '"board_size": "3x4", "game_id": "g13", "turn_token": "t1", '
-           '"score_1": 0, "score_2": 0, "remaining_moves": 400}}')
-    await bot._play(FakeWebSocket(incoming=[raw]))
-    board_str = strategy.calls[0][0][0]
-    assert board_str == TABLERO_V8
-    assert all(len(row) == 6 for row in board_str.split('\n'))   # 4 celdas + 2 '|'
-
-
-def test_game_logger_escribe_en_utf8(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    logger = GameLogger()
-    logger.log_event('g14', {'event': 'your_turn', 'data': {'board': TABLERO_V8}})
-    logger.write('g14')
-    contenido = (tmp_path / 'game_g14.log').read_text(encoding='utf-8')
-    linea = contenido.strip()
-    assert json.loads(linea[linea.index('{'):])['data']['board'] == TABLERO_V8
+    def test_main_with_token_starts_bot(self):
+        argv = ['run.py', 'mi-token-de-prueba']
+        with mock.patch.object(sys, 'argv', argv):
+            with self.offline(fake_connect(interrupt)), self.capture():
+                runpy.run_module('run', run_name='__main__')
