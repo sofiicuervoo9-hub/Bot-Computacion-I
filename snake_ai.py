@@ -45,6 +45,8 @@ FIXED_PENALTY = 500
 TAIL_FOOD_POINTS = 100
 # Celdas que conserva la vibora despues de chocar.
 CRASH_KEEP_CELLS = 3
+# v10: turnos de invencibilidad por debajo de los cuales conviene renovarla.
+STAR_REFRESH_TURNS = 10
 
 
 class Turn:
@@ -144,6 +146,7 @@ class SnakeStrategy:
         self._last_score = None
         self._turns_played = 0
         self._food_eaten = 0
+        self._my_invincible = 0
 
     def choose_direction(
         self,
@@ -156,10 +159,14 @@ class SnakeStrategy:
         remaining_moves=None,
         my_multiplier=None,
         opp_multiplier=None,
+        invincible=(0, 0),
     ):
-        board = self._parse_board(board_str, side, board_size, next_digit)
+        board = self._parse_board(
+            board_str, side, board_size, next_digit, invincible
+        )
         if board is None or board.head is None:
             return FALLBACK_DIRECTION
+        self._my_invincible = invincible[0] or 0
         self._track_body(board)
         self._track_pace(my_score)
         candidates = self._build_candidates(board, my_score, opp_multiplier)
@@ -178,9 +185,10 @@ class SnakeStrategy:
         return self._decide(turn)
 
     @staticmethod
-    def _parse_board(board_str, side, board_size, next_digit):
+    def _parse_board(board_str, side, board_size, next_digit, invincible):
+        flags = tuple(bool(turns) for turns in invincible)
         try:
-            return Board(board_str, side, board_size, next_digit)
+            return Board(board_str, side, board_size, next_digit, flags)
         except Exception:
             return None
 
@@ -215,6 +223,7 @@ class SnakeStrategy:
         """Prueba cada plan en orden de prioridad; si ninguno aplica, busca
         territorio."""
         for plan in (
+            self._star_step,
             self._tail_step,
             self._target_step,
             self._wait_step,
@@ -229,9 +238,25 @@ class SnakeStrategy:
             turn.board, turn.candidates, aggressive
         )
 
+    def _star_step(self, turn):
+        """v10: la estrella primero si llego antes y no tengo mucha
+        invencibilidad."""
+        if self._my_invincible > STAR_REFRESH_TURNS:
+            return None
+        step, _ = self._best_target_move(
+            turn.candidates, turn.board.stars, turn.safety_buffer
+        )
+        return step
+
+    @staticmethod
+    def _extra_food(board):
+        """Comida fuera de la serie: mi cola Ⓐ/Ⓑ, '*' de disparo y
+        estrellas."""
+        return board.tail_food + board.bonus_food
+
     def _tail_step(self, turn):
         step, dist = self._best_target_move(
-            turn.candidates, turn.board.tail_food, turn.safety_buffer
+            turn.candidates, self._extra_food(turn.board), turn.safety_buffer
         )
         if step is not None and self._tail_first(
             turn.board, turn.candidates, turn.food_step, turn.food_dist, dist
@@ -301,13 +326,15 @@ class SnakeStrategy:
 
     @staticmethod
     def _body_guesses(prev, head):
-        """Cuerpos posibles: avanzo, avanzo y crezco, no me muevo, o choco."""
+        """Cuerpos posibles: avanzo, avanzo y crezco, no me muevo, choco o me
+        cortan (v9)."""
+        shifted = [head] + prev[:-1]
         return [
-            [head] + prev[:-1],
+            shifted,
             [head] + prev,
             prev,
             prev[:CRASH_KEEP_CELLS],
-        ]
+        ] + [shifted[:k] for k in range(len(shifted) - 1, 0, -1)]
 
     @staticmethod
     def _matches(body, cells):
@@ -392,6 +419,9 @@ class SnakeStrategy:
             food_dist,
             turns,
         )
+        if mult_dist <= food_dist:
+            # El 'X' esta mas cerca pero el desvio me hace perder el digito.
+            return mult_step if x_value > digit_value else food_step
         if x_value / max(1, mult_dist) > digit_value / max(1, food_dist):
             return mult_step
         return food_step
@@ -419,7 +449,9 @@ class SnakeStrategy:
             return True
         if tail_dist * (board.target_digit or 1) > food_dist:
             return False
-        via_tail = self._via(board, candidates, board.tail_food, board.food)
+        via_tail = self._via(
+            board, candidates, self._extra_food(board), board.food
+        )
         return self._arrives_first(
             via_tail, self._opp_time_to(board.food, self._food_bonus)
         )
@@ -495,11 +527,15 @@ class SnakeStrategy:
         None)."""
         if not positions:
             return None
-        totals = [
-            d + self._closest_gap(stop, positions)
-            for stop, d in self._stop_distances(candidates, stops)
-        ]
+        totals = list(self._via_totals(board, candidates, stops, positions))
         return min(totals) if totals else None
+
+    def _via_totals(self, board, candidates, stops, positions):
+        """Pasos hasta cada parada mas el tramo real hasta `positions`."""
+        for stop, d in self._stop_distances(candidates, stops):
+            gap = self._real_gap(board, stop, positions)
+            if gap is not None:
+                yield d + gap
 
     def _stop_distances(self, candidates, stops):
         for stop in stops:
@@ -510,6 +546,21 @@ class SnakeStrategy:
     @staticmethod
     def _closest_gap(cell, positions):
         return min(Board.manhattan(cell, p) for p in positions)
+
+    @staticmethod
+    def _real_gap(board, cell, positions):
+        """Pasos reales de `cell` a la copia mas cercana (esquiva bombas,
+        muros, cuerpos y digitos equivocados)."""
+        blocked = (
+            board.body_cells
+            | board.opponent_blocked
+            | board.wall_cells
+            | board.bomb_zone
+            | board.wrong_digit_positions
+        ) - {cell}
+        dist = board.bfs_all_distances(cell, blocked)
+        gaps = [dist[p] for p in positions if p in dist]
+        return min(gaps) if gaps else None
 
     def _x_keeps_race(self, board, candidates, targets, opp_time=None):
         """True si despues de comer un 'X' sigo llegando a `targets` antes que
@@ -637,14 +688,29 @@ class SnakeStrategy:
     ):
         """Compara lo que rinde el 'X' con lo que rinde esperar (valor x
         probabilidad)."""
-        if not any(
-            self._my_dist(candidates, x) for x in board.multiplier_pickups
-        ):
+        x_dist = self._closest_dist(candidates, board.multiplier_pickups)
+        if x_dist is None:
             return False
         wait_value = WAIT_WIN_PROB * self._digit_value(
             board.digit_values[positions[0]], my_multiplier
         )
-        return self._x_gain(board, remaining_moves) >= wait_value
+        # Se espera en una vecina: el digito todavia no es comestible.
+        spots = self._wait_spots(board, positions)
+        wait_dist = self._closest_dist(candidates, spots) or 1
+        # Puntos por paso, la misma cuenta que digito contra 'X'.
+        return (
+            self._x_gain(board, remaining_moves) / x_dist
+            >= wait_value / wait_dist
+        )
+
+    def _closest_dist(self, candidates, targets):
+        """Mis pasos hasta el mas cercano de `targets` (o None)."""
+        dists = [
+            d
+            for d in (self._my_dist(candidates, t) for t in targets)
+            if d is not None
+        ]
+        return min(dists) if dists else None
 
     def _wait_next_to(
         self, board, candidates, positions, opp_time, safety_buffer
@@ -714,16 +780,23 @@ class SnakeStrategy:
         score = my_score if my_score is not None else 0
         return score if score > 0 else FIXED_PENALTY
 
+    def _move_costs(self, board, my_score, opp_multiplier):
+        """(choque, bomba, digito equivocado); invencible no pierde nada."""
+        if self._my_invincible:
+            return 0, 0, 0
+        return (
+            self._crash_cost(board, my_score, opp_multiplier),
+            self._bomb_cost(my_score),
+            FIXED_PENALTY,
+        )
+
     def _build_candidates(self, board, my_score=None, opp_multiplier=None):
         """Evalua cada movimiento posible (espacio, territorio, camino,
         distancias, costos)."""
         self._opp_dist = board.bfs_all_distances(
             board.opponent_head, self._opponent_static_blocked(board)
         )
-        costs = (
-            self._crash_cost(board, my_score, opp_multiplier),
-            self._bomb_cost(my_score),
-        )
+        costs = self._move_costs(board, my_score, opp_multiplier)
         candidates = {
             dname: self._evaluate_move(board, dname, pos, costs)
             for dname, pos in self._legal_moves(board)
@@ -765,6 +838,7 @@ class SnakeStrategy:
         return (
             set(board.food)
             | set(board.tail_food)
+            | set(board.bonus_food)
             | board.wrong_digit_positions
         )
 
@@ -834,9 +908,9 @@ class SnakeStrategy:
     @staticmethod
     def _penalty(cand, costs):
         """Costo estimado del paso; sin camino de salida equivale a chocar."""
-        crash_cost, bomb_cost = costs
+        crash_cost, bomb_cost, wrong_cost = costs
         return (
-            FIXED_PENALTY * cand['wrong_digit']
+            wrong_cost * cand['wrong_digit']
             + crash_cost * cand['wall_hit']
             + bomb_cost * cand['bomb_hit']
             + crash_cost * (not cand['path_ok'])
@@ -1031,6 +1105,7 @@ def choose_direction(
     next_digit=None,
     my_multiplier=None,
     opp_multiplier=None,
+    invincible=(0, 0),
 ):
     return _default_strategy.choose_direction(
         board,
@@ -1042,4 +1117,26 @@ def choose_direction(
         remaining_moves,
         my_multiplier,
         opp_multiplier,
+        invincible,
     )
+
+
+def safe_direction(board_str, side, board_size=None, invincible=(0, 0)):
+    """Jugada de emergencia sin estrategia: la vecina con menos riesgo."""
+    flags = tuple(bool(turns) for turns in invincible)
+    try:
+        board = Board(board_str, side, board_size, None, flags)
+    except Exception:
+        return FALLBACK_DIRECTION
+    if board.head is None:
+        return FALLBACK_DIRECTION
+    options = sorted(
+        board.neighbors(board.head), key=lambda item: _risk(board, item[1])
+    )
+    return options[0][0] if options else FALLBACK_DIRECTION
+
+
+def _risk(board, pos):
+    """2 si choco, 1 si explota una bomba, 0 si la celda es segura."""
+    hard = board.body_cells | board.opponent_blocked | board.wall_cells
+    return 2 * (pos in hard) + (pos in board.bomb_zone)

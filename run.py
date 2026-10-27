@@ -3,19 +3,23 @@ SnakeStrategy."""
 
 import asyncio
 import json
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime
-from random import choice
-
 import websockets
 
-from board import DIRECTIONS
-from snake_ai import SnakeStrategy
+from snake_ai import SnakeStrategy, safe_direction
 
 SERVER_URL = "wss://server.codechallenge.net.ar/ws"
+# Si existe este archivo, el bot termina sus partidas y se apaga.
+STOP_FILE = "stop"
+
+
+def stop_requested():
+    return os.path.exists(STOP_FILE)
 
 
 def safe_print(text):
@@ -137,8 +141,19 @@ class SnakeBot:
             self.logger.log_event(game_id, request_data)
             self.logger.write(game_id)
             self._strategies.pop(game_id, None)
+        self._stop_if_idle()
+
+    def _stop_if_idle(self):
+        """Con el archivo de parada y sin partidas en curso, apaga el bot."""
+        if stop_requested() and not self._strategies:
+            print(f"'{STOP_FILE}' found and no game in progress: exiting")
+            raise SystemExit(0)
 
     async def _on_challenge(self, websocket, request_data):
+        if stop_requested():
+            print(f"'{STOP_FILE}' found: challenge not accepted")
+            self._stop_if_idle()
+            return
         await self._send(
             websocket,
             'accept_challenge',
@@ -164,7 +179,21 @@ class SnakeBot:
             'remaining_moves': data.get('remaining_moves'),
             'my_multiplier': data.get('multiplier_' + mine),
             'opp_multiplier': data.get('multiplier_' + theirs),
+            'invincible': (
+                data.get('invincible_' + mine) or 0,
+                data.get('invincible_' + theirs) or 0,
+            ),
         }
+
+    @staticmethod
+    def _fallback(board_str, side, kwargs):
+        """La jugada menos mala, sin pasar por la estrategia."""
+        return safe_direction(
+            board_str,
+            side,
+            kwargs.get('board_size'),
+            kwargs.get('invincible', (0, 0)),
+        )
 
     async def _process_turn(self, websocket, request_data):
         data = request_data['data']
@@ -178,10 +207,12 @@ class SnakeBot:
                 data['side'],
                 **self._turn_kwargs(data),
             )
-        except Exception:
-            # Ante un error en la estrategia, mejor una direccion al azar que
-            # no responder.
-            direction = choice(list(DIRECTIONS.keys()))
+        except Exception as e:
+            # Queda registrado y se juega la jugada menos mala, no al azar.
+            print(f"ERROR: strategy failed: {e!r}, using the safest move")
+            direction = self._fallback(
+                data['board'], data['side'], self._turn_kwargs(data)
+            )
         elapsed_ms = (time.perf_counter() - start) * 1000
         print(f"decision: {direction} in {elapsed_ms:.1f} ms")
 
@@ -207,9 +238,9 @@ class SnakeBot:
         except FutureTimeoutError:
             print(
                 f"WARNING: strategy took longer than "
-                f"{self.decision_timeout}s, using a random direction"
+                f"{self.decision_timeout}s, using the safest move"
             )
-            return choice(list(DIRECTIONS.keys()))
+            return self._fallback(board_str, side, kwargs)
         finally:
             executor.shutdown(wait=False)
 

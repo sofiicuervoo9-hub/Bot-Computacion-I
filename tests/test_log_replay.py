@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from board import DIRECTIONS, Board
-from log_replay import GameLogReplay
+from log_replay import GameLogReplay, ScoreCheck
 from run import GameLogger
 
 FIXTURES = os.path.join(os.path.dirname(__file__), 'fixtures')
@@ -71,3 +71,62 @@ class GameLogReplayTest(unittest.TestCase):
             finally:
                 os.chdir(previous)
         assert len(results) == 1 and results[0][1] == 'right'
+
+    def test_scores_of_the_trap_game_follow_the_rules(self):
+        # Incluye el primer choque, que dejo el puntaje en 0.
+        assert GameLogReplay(TRAP_GAME).check_scores() == []
+
+    def test_check_scores_reports_a_mismatch(self):
+        replay = GameLogReplay(TRAP_GAME)
+        first = replay.messages[0][1]['data']
+        first['score_1'] = first['score_2'] = 123456
+        mismatches = replay.check_scores()
+        assert mismatches[0][0] == first['remaining_moves']
+
+
+def turn(rows, size, **extra):
+    data = {
+        'board': '\n'.join('|' + row + '|' for row in rows),
+        'side': 'A',
+        'board_size': size,
+        'score_1': 1000,
+        'multiplier_1': 2,
+    }
+    data.update(extra)
+    return data
+
+
+class ScoreCheckTest(unittest.TestCase):
+    """Tests de ScoreCheck: el puntaje que predicen las reglas."""
+
+    def test_plain_move_is_plus_one(self):
+        data = turn(['aA...', '....1'], '2x5')
+        assert ScoreCheck().expected(data, 'right') == 1001
+
+    def test_target_digit_times_multiplier(self):
+        data = turn(['aA1..', '....2'], '2x5')
+        assert ScoreCheck().expected(data, 'right') == 1200
+
+    def test_wrong_digit_is_penalty(self):
+        data = turn(['aA2..', '....1'], '2x5')
+        assert ScoreCheck().expected(data, 'right') == 500
+
+    def test_x_is_fifty_without_multiplier(self):
+        data = turn(['aAX..', '....1'], '2x5')
+        assert ScoreCheck().expected(data, 'right') == 1050
+
+    def test_shot_food_and_tail_food(self):
+        assert ScoreCheck().expected(turn(['aA*..'], '1x5'), 'right') == 1200
+        tail = turn(['aA\u24b6..'], '1x5')
+        assert ScoreCheck().expected(tail, 'right') == 1200
+
+    def test_first_crash_wipes_then_minus_500(self):
+        check = ScoreCheck()
+        assert check.expected(turn(['aA'], '1x2'), 'right') == 0
+        assert check.expected(turn(['aA'], '1x2'), 'right') == 500
+
+    def test_bomb_and_invincible_are_not_checked(self):
+        bomb = turn(['aA.' + '\U0001f9e8'], '1x4')
+        assert ScoreCheck().expected(bomb, 'right') is None
+        star = turn(['Aa.'], '1x3', invincible_1=10)
+        assert ScoreCheck().expected(star, 'right') is None

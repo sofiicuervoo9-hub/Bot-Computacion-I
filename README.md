@@ -48,6 +48,13 @@ connects to the production server; switch the `uri` in `run.py` to the
 > `start.sh` / `start_dev.sh` are convenience runners kept out of git because
 > they may embed your personal token.
 
+### Stopping without losing a game
+
+Don't stop the bot with Ctrl+C in the middle of a match: every unanswered turn
+is a timeout. Create an empty file named `stop` in the working directory
+instead: the bot stops accepting challenges, finishes the games in progress
+and exits. Delete `stop` before starting it again.
+
 ## Game logs
 
 When a match ends, the client writes a **`game_<game_id>.log`** in the working
@@ -62,6 +69,17 @@ debugging a match. These files are git-ignored.
 < {"event": "game_over", "data": {"board": "...", "game_id": "g_9f", ...}}
 ```
 
+To replay a match with the current strategy and check that every score the
+server sent matches the rules:
+
+```python
+from log_replay import GameLogReplay
+
+replay = GameLogReplay('game_<game_id>.log')
+replay.replay()        # (data, logged move, move chosen today)
+replay.check_scores()  # [] if every score matches the rules
+```
+
 ## Write your own bot
 
 You don't need this client — any websocket client works. The contract is:
@@ -69,4 +87,4 @@ You don't need this client — any websocket client works. The contract is:
 1. Connect to `ws(s)://<server>/ws?token=<your bot token>`.
 2. On `challenge`, send `{"action": "accept_challenge", "data": {"challenge_id": "..."}}`.
 3. On `your_turn`, read `data` (board / game state, `game_id`, `turn_token`) and
-   send your move: `{"action": "move", "data": { ... , "turn_token": "..." }}`.
+   send your move: `{"action": "move", "data": { ... , "turn_token": "..." }}`.

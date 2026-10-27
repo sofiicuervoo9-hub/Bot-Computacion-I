@@ -15,7 +15,7 @@ from unittest import mock
 import websockets
 
 from board import DIRECTIONS
-from run import SERVER_URL, GameLogger, SnakeBot, safe_print
+from run import SERVER_URL, STOP_FILE, GameLogger, SnakeBot, safe_print
 from snake_ai import SnakeStrategy
 
 BOARD_V8 = '|A..\U0001f4a3|\n|.Ⓐ.\U0001f9e8|\n|..bB|'
@@ -343,6 +343,16 @@ class ProcessTurnTest(BotTestCase):
         mults = (kwargs['my_multiplier'], kwargs['opp_multiplier'])
         assert mults == (None, None)
 
+    async def test_side_b_uses_invincible_2_as_mine(self):
+        kwargs = await self.strategy_kwargs(
+            make_turn_data('g7c', side='B', invincible_1=7, invincible_2=3)
+        )
+        assert kwargs['invincible'] == (3, 7)
+
+    async def test_without_invincible_passes_zero(self):
+        kwargs = await self.strategy_kwargs(make_turn_data('g6d'))
+        assert kwargs['invincible'] == (0, 0)
+
     async def test_broken_strategy_uses_random_direction(self):
         ws = FakeWebSocket()
         with self.capture():
@@ -350,6 +360,16 @@ class ProcessTurnTest(BotTestCase):
                 ws, {'data': make_turn_data('g9')}
             )
         assert json.loads(ws.sent[0])['data']['direction'] in DIRECTIONS
+
+    async def test_broken_strategy_prints_error_and_plays_safest(self):
+        ws = FakeWebSocket()
+        data = make_turn_data('g9b', board='|.aaA|\n|.....|', board_size='2x5')
+        with self.capture() as out:
+            await make_bot(FakeStrategy(raise_error=True))._process_turn(
+                ws, {'data': data}
+            )
+        assert 'estrategia rota' in out.getvalue()
+        assert json.loads(ws.sent[0])['data']['direction'] == 'down'
 
     async def test_prints_decision_time(self):
         with self.capture() as out:
@@ -396,6 +416,69 @@ class TimeoutTest(BotTestCase):
             )
         assert d in DIRECTIONS
         assert 'WARNING' in out.getvalue()
+
+    def test_timeout_plays_the_safest_move(self):
+        bot = SnakeBot(
+            'tok',
+            strategy=SlowStrategy(delay_seconds=0.3),
+            decision_timeout=0.05,
+        )
+        with self.capture():
+            d = bot._choose_direction_with_timeout(
+                bot.strategy, '|.aaA|\n|.....|', 'A', board_size='2x5'
+            )
+        assert d == 'down'
+
+
+# -- archivo de parada -----------------------------------------------------
+
+
+class StopFileTest(BotTestCase):
+    """Con el archivo de parada termina sus partidas y se apaga."""
+
+    def setUp(self):
+        self._previous = os.getcwd()
+        self._folder = tempfile.TemporaryDirectory()
+        os.chdir(self._folder.name)
+
+    def tearDown(self):
+        os.chdir(self._previous)
+        self._folder.cleanup()
+
+    @staticmethod
+    def request_stop():
+        open(STOP_FILE, 'w').close()
+
+    async def test_without_stop_file_accepts_challenges(self):
+        ws = FakeWebSocket()
+        with self.capture():
+            await make_bot()._on_challenge(
+                ws, {'data': {'challenge_id': 'c1'}}
+            )
+        assert json.loads(ws.sent[0])['action'] == 'accept_challenge'
+
+    async def test_stop_file_refuses_challenge_and_exits_when_idle(self):
+        self.request_stop()
+        ws = FakeWebSocket()
+        with self.capture(), self.assertRaises(SystemExit):
+            await SnakeBot('tok')._on_challenge(
+                ws, {'data': {'challenge_id': 'c1'}}
+            )
+        assert ws.sent == []
+
+    async def test_stop_file_waits_for_games_in_progress(self):
+        self.request_stop()
+        bot = SnakeBot('tok')
+        bot.strategy_for('g1')
+        bot.strategy_for('g2')
+        with self.capture():
+            await bot._on_game_over(
+                FakeWebSocket(), {'data': {'game_id': 'g1'}}
+            )
+        with self.capture(), self.assertRaises(SystemExit):
+            await bot._on_game_over(
+                FakeWebSocket(), {'data': {'game_id': 'g2'}}
+            )
 
 
 # -- SnakeBot._play y run --------------------------------------------------

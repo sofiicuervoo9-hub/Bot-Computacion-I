@@ -17,12 +17,16 @@ BIG_BOMB = '\U0001f4a3'
 SMALL_BOMB = '\U0001f9e8'
 BOMB_RADIUS = {BIG_BOMB: 2, SMALL_BOMB: 1}
 
+# v10: estrella de invencibilidad.
+STAR = '\u2b50'
+
 # Selector de variacion de emoji: no ocupa una celda propia.
 _VARIATION_SELECTOR = '️'
 
 # Simbolos que no dependen del lado que juego.
 _FIXED_KINDS = {
     '*': 'food',
+    STAR: 'star',
     'X': 'pickup',
     '#': 'wall',
     BIG_BOMB: 'bomb',
@@ -33,11 +37,23 @@ _FIXED_KINDS = {
 class Board:
     """Estado del tablero en un turno; se reconstruye desde cero cada turno."""
 
-    def __init__(self, board_str, side, board_size=None, next_digit=None):
+    def __init__(
+        self,
+        board_str,
+        side,
+        board_size=None,
+        next_digit=None,
+        invincible=(False, False),
+    ):
         self.side = side
-        self.my_body_char = side.lower()
         self.opponent = 'B' if side == 'A' else 'A'
-        self.opponent_body = self.opponent.lower()
+        # v10: con invencibilidad la cabeza va en minuscula y el cuerpo no.
+        self.my_head_char, self.my_body_char = self._snake_chars(
+            side, invincible[0]
+        )
+        self.opp_head_char, self.opponent_body = self._snake_chars(
+            self.opponent, invincible[1]
+        )
         self._kinds = self._build_kinds()
 
         self.grid = self._parse_grid(board_str)
@@ -54,6 +70,8 @@ class Board:
         self.tail_food = []  # comida de cola que puedo comer yo
         self.own_shed_tail = []  # mi cola perdida (la come el rival)
         self.bombs = []  # [(pos, radio)]
+        self.bonus_food = []  # '*' de disparo y estrella, fuera de la serie
+        self.stars = []
         self._scan_cells()
         self.bomb_zone = self._compute_bomb_zone()
 
@@ -70,14 +88,21 @@ class Board:
 
     # -- construccion --------------------------------------------------
 
+    @staticmethod
+    def _snake_chars(letter, invincible):
+        """(cabeza, cuerpo) de una vibora segun este invencible o no."""
+        if invincible:
+            return letter.lower(), letter.upper()
+        return letter.upper(), letter.lower()
+
     def _build_kinds(self):
         """Que es cada simbolo del tablero visto desde mi lado."""
         kinds = dict(_FIXED_KINDS)
         kinds.update(
             {
-                self.side: 'head',
+                self.my_head_char: 'head',
                 self.my_body_char: 'body',
-                self.opponent: 'opp_head',
+                self.opp_head_char: 'opp_head',
                 self.opponent_body: 'opp_body',
                 TAIL_FOOD.get(self.side): 'tail_food',
                 TAIL_FOOD.get(self.opponent): 'shed_tail',
@@ -131,6 +156,11 @@ class Board:
 
     def _add_food(self, pos, ch):
         self.food.append(pos)
+        self.bonus_food.append(pos)
+
+    def _add_star(self, pos, ch):
+        self.stars.append(pos)
+        self.bonus_food.append(pos)
 
     def _add_pickup(self, pos, ch):
         self.multiplier_pickups.append(pos)

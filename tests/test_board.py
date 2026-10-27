@@ -1,7 +1,7 @@
 """Tests unitarios de board.py."""
 
 import unittest
-from board import Board, DIRECTIONS
+from board import STAR, Board, DIRECTIONS
 
 
 def make_board_str(rows):
@@ -43,6 +43,28 @@ def bomb_in_the_middle(bomb):
     rows = ['.' * 9 for _ in range(9)]
     rows[4] = '....' + bomb + '....'
     return Board(make_board_str(rows), 'A', board_size='9x9').bomb_zone
+
+
+# -- v9/v10: comida de disparo, estrella e invencibilidad -----------------
+
+V10_DIGITS = {
+    (8, 8): '1',
+    (8, 10): '2',
+    (0, 0): '3',
+    (9, 0): '4',
+    (0, 11): '5',
+}
+NORMAL_A = {(2, 1): 'a', (2, 2): 'a', (2, 3): 'A'}
+INVINCIBLE_A = {(2, 1): 'A', (2, 2): 'A', (2, 3): 'a'}
+NORMAL_B = {(6, 6): 'B', (6, 7): 'b', (6, 8): 'b'}
+INVINCIBLE_B = {(6, 6): 'b', (6, 7): 'B', (6, 8): 'B'}
+
+
+def v10_board_str(cells, n_rows=10, n_cols=12):
+    grid = [[' '] * n_cols for _ in range(n_rows)]
+    for (r, c), ch in {**V10_DIGITS, **cells}.items():
+        grid[r][c] = ch
+    return '\n'.join('|' + ''.join(row) + '|' for row in grid)
 
 
 class BoardTest(unittest.TestCase):
@@ -411,3 +433,35 @@ class BoardTest(unittest.TestCase):
     def test_chebyshev(self):
         assert Board.chebyshev((0, 0), (2, 1)) == 2
         assert Board.chebyshev((3, 3), (3, 3)) == 0
+
+    def test_star_is_bonus_food(self):
+        cells = {**NORMAL_A, **NORMAL_B, (2, 5): STAR}
+        b = Board(v10_board_str(cells), 'A', '10x12')
+        assert b.stars == [(2, 5)]
+        assert (2, 5) in b.bonus_food
+
+    def test_shot_food_survives_digits(self):
+        cells = {**NORMAL_A, **NORMAL_B, (2, 4): '*'}
+        b = Board(v10_board_str(cells), 'A', '10x12')
+        assert (2, 4) in b.bonus_food
+        assert (2, 4) not in b.food
+
+    def test_my_invincible_snake(self):
+        b = Board(
+            v10_board_str({**INVINCIBLE_A, **NORMAL_B}),
+            'A',
+            '10x12',
+            invincible=(True, False),
+        )
+        assert b.head == (2, 3)
+        assert b.ordered_body == [(2, 3), (2, 2), (2, 1)]
+
+    def test_opponent_invincible_snake(self):
+        b = Board(
+            v10_board_str({**NORMAL_A, **INVINCIBLE_B}),
+            'A',
+            '10x12',
+            invincible=(False, True),
+        )
+        assert b.opponent_head == (6, 6)
+        assert b.opponent_blocked == {(6, 6), (6, 7), (6, 8)}

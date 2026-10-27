@@ -4,7 +4,7 @@ choose_direction)."""
 import unittest
 import time
 
-from board import Board, DIRECTIONS
+from board import STAR, Board, DIRECTIONS
 from snake_ai import (
     FALLBACK_DIRECTION,
     FIXED_PENALTY,
@@ -16,6 +16,7 @@ from snake_ai import (
     EscapeSearch,
     SnakeStrategy,
     choose_direction,
+    safe_direction,
 )
 
 TAIL_A, TAIL_B = 'Ⓐ', 'Ⓑ'
@@ -519,6 +520,69 @@ def plus_shaped_trap():
         grid[r][c] = 'a'
     grid[3][6] = 'A'
     return grid_to_str(grid)
+
+
+# -- v9/v10: comida de disparo, estrella e invencibilidad -----------------
+
+V10_DIGITS = {
+    (8, 8): '1',
+    (8, 10): '2',
+    (0, 0): '3',
+    (9, 0): '4',
+    (0, 11): '5',
+}
+NORMAL_A = {(2, 1): 'a', (2, 2): 'a', (2, 3): 'A'}
+INVINCIBLE_A = {(2, 1): 'A', (2, 2): 'A', (2, 3): 'a'}
+NORMAL_B = {(6, 6): 'B', (6, 7): 'b', (6, 8): 'b'}
+INVINCIBLE_B = {(6, 6): 'b', (6, 7): 'B', (6, 8): 'B'}
+
+
+def v10_board_str(cells, n_rows=10, n_cols=12):
+    grid = [[' '] * n_cols for _ in range(n_rows)]
+    for (r, c), ch in {**V10_DIGITS, **cells}.items():
+        grid[r][c] = ch
+    return '\n'.join('|' + ''.join(row) + '|' for row in grid)
+
+
+def v10_choose(cells, invincible=(0, 0)):
+    return SnakeStrategy().choose_direction(
+        v10_board_str(cells),
+        'A',
+        board_size='10x12',
+        my_score=500,
+        opp_score=300,
+        remaining_moves=300,
+        my_multiplier=1,
+        opp_multiplier=1,
+        invincible=invincible,
+    )
+
+
+# -- partida my_match 20: desvio a un 'X' que hace perder el 9 ---------------
+
+MATCH20_ROWS = [
+    '    2        3 1          ',
+    ' ' + SMALL + '            #####       ',
+    '                    4     ',
+    '                       9  ',
+    '      aa                  ',
+    '     aaaaA                ',
+    '  1               4       ',
+    '        1     ' + SMALL + '  9   3    ',
+    '           X4    1      3 ',
+    '           Bbbbbbb        ',
+    '                          ',
+    '                       ' + BIG + BIG + ' ',
+    '          2       4       ',
+    '            3   3  X      ',
+    '                          ',
+    '                          ',
+    SMALL + SMALL + '       9      ' + SMALL + '         ',
+    '                          ',
+    '             9            ',
+    '        2            9    ',
+    '                          ',
+]
 
 
 class SnakeStrategyTest(unittest.TestCase):
@@ -1829,3 +1893,92 @@ class SnakeStrategyTest(unittest.TestCase):
         s = SnakeStrategy()
         cands = s._build_candidates(board)
         assert s._x_beats_waiting(board, cands, [(1, 1)], 1, 300) is False
+
+    def test_goes_for_star_it_wins(self):
+        cells = {**NORMAL_A, **NORMAL_B, (2, 5): STAR}
+        assert v10_choose(cells) == 'right'
+
+    def test_long_invincibility_skips_star_step(self):
+        s = SnakeStrategy()
+        s.choose_direction(
+            v10_board_str({**INVINCIBLE_A, **NORMAL_B, (2, 5): STAR}),
+            'A',
+            board_size='10x12',
+            invincible=(40, 0),
+        )
+        assert s._my_invincible == 40
+
+    def test_invincible_moves_from_real_head(self):
+        cells = {**INVINCIBLE_A, **NORMAL_B}
+        assert v10_choose(cells, invincible=(30, 0)) != 'left'
+
+    def test_invincible_costs_nothing(self):
+        s = SnakeStrategy()
+        s._my_invincible = 5
+        board = Board(v10_board_str({**NORMAL_A, **NORMAL_B}), 'A', '10x12')
+        assert s._move_costs(board, 900, 1) == (0, 0, 0)
+
+    def test_match20_keeps_the_nine_instead_of_x(self):
+        move = SnakeStrategy().choose_direction(
+            make_board_str(MATCH20_ROWS),
+            'B',
+            board_size='21x26',
+            my_score=18055,
+            opp_score=8589,
+            remaining_moves=167,
+            my_multiplier=8,
+            opp_multiplier=7,
+        )
+        assert move == 'down'
+
+    def test_real_gap_goes_around_a_bomb(self):
+        board = Board(make_board_str(MATCH20_ROWS), 'B', '21x26')
+        gap = SnakeStrategy._real_gap(board, (8, 11), [(7, 17)])
+        assert gap > Board.manhattan((8, 11), (7, 17))
+
+    def test_real_gap_unreachable_is_none(self):
+        rows = ['A#.', '##.', '..1']
+        board = Board(make_board_str(rows), 'A', '3x3')
+        assert SnakeStrategy._real_gap(board, (0, 0), [(2, 2)]) is None
+
+    def test_tracking_follows_a_shot_cut(self):
+        # Me dispararon (v9): de 8 celdas a 3, con la cabeza un paso mas alla.
+        s = SnakeStrategy()
+        prev = [(1, 7 - i) for i in range(8)]
+        guesses = s._body_guesses(prev, (1, 8))
+        assert [(1, 8), (1, 7), (1, 6)] in guesses
+
+    def test_tracking_keeps_the_tail_after_a_shot_cut(self):
+        s = SnakeStrategy()
+        s._last_body = [(1, 7 - i) for i in range(8)]
+        board = Board(make_board_str(['  ****  aaA ']), 'A', '1x12')
+        s._track_body(board)
+        assert board.tail == (0, 8)
+
+    def test_x_beats_waiting_counts_the_steps(self):
+        # El 'X' rinde mas en total, pero esta mucho mas lejos que la espera.
+        rows = [
+            'X...........',
+            '............',
+            '............',
+            '............',
+            '.........aA.',
+            '..........5B',
+        ]
+        board = Board(make_board_str(rows), 'A', '6x12')
+        s = SnakeStrategy()
+        cands = s._build_candidates(board)
+        assert s._x_gain(board, 40) > WAIT_WIN_PROB * 5 * 100
+        assert s._x_beats_waiting(board, cands, [(5, 10)], 1, 40) is False
+
+    def test_safe_direction_avoids_bodies_and_bombs(self):
+        rows = ['......', '.aaA..', '..' + SMALL + '...', '......']
+        assert safe_direction(make_board_str(rows), 'A', '4x6') == 'up'
+
+    def test_safe_direction_avoids_walls(self):
+        rows = ['.#.', 'aA#', '...']
+        assert safe_direction(make_board_str(rows), 'A', '3x3') == 'down'
+
+    def test_safe_direction_without_head_or_board(self):
+        assert safe_direction('|...|', 'A', '1x3') == FALLBACK_DIRECTION
+        assert safe_direction(None, 'A') == FALLBACK_DIRECTION
