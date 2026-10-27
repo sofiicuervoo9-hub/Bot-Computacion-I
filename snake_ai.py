@@ -89,22 +89,31 @@ class EscapeSearch:
         self.budget = PATH_SEARCH_BUDGET
 
     def run(self):
-        return self._extend(self.start, 0)
+        """Busqueda en profundidad con pila propia (sin recursion: en Python
+        3.10/3.11 un cuerpo largo agotaba el limite)."""
+        stack = []
+        if self._enter(self.start, 0, stack):
+            return True
+        while stack:
+            pos, depth, cells = stack[-1]
+            cell = next(cells, None)
+            if cell is None:
+                stack.pop()
+                self.visited.discard(pos)
+                continue
+            self.visited.add(cell)
+            if self._enter(cell, depth + 1, stack):
+                return True
+        return False
 
-    def _extend(self, pos, depth):
+    def _enter(self, pos, depth, stack):
+        """True si ya alcanza; si no, apila las celdas a probar desde
+        `pos`."""
         if depth >= self.need or self.budget <= 0:
             return True
         self.budget -= 1
-        return any(
-            self._try(cell, depth + 1)
-            for cell in self._next_cells(pos, depth + 1)
-        )
-
-    def _try(self, cell, depth):
-        self.visited.add(cell)
-        found = self._extend(cell, depth)
-        self.visited.discard(cell)
-        return found
+        stack.append((pos, depth, iter(self._next_cells(pos, depth + 1))))
+        return False
 
     def _next_cells(self, pos, step):
         cells = [
