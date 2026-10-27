@@ -465,3 +465,10 @@ class BoardTest(unittest.TestCase):
         )
         assert b.opponent_head == (6, 6)
         assert b.opponent_blocked == {(6, 6), (6, 7), (6, 8)}
+
+    def test_zone_after_explosion_drops_only_that_bomb(self):
+        rows = ['.' * 9 for _ in range(3)]
+        rows[1] = '.' + SMALL + '.....' + SMALL + '.'
+        b = Board(make_board_str(rows), 'A', '3x9')
+        zone = b.zone_after_explosion((1, 2))
+        assert (1, 0) not in zone and (1, 8) in zone

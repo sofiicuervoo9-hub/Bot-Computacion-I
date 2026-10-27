@@ -75,15 +75,14 @@ class EscapeSearch:
     """Busca un camino simple tan largo como el cuerpo, con la cola liberando
     celdas."""
 
-    def __init__(self, board, body):
+    def __init__(self, board, body, bomb_zone=None):
         self.board = board
         self.need = len(body)
         # La celda i del cuerpo (0 = cabeza) queda libre en len(body) - i
         # jugadas.
         self.free_at = {cell: len(body) - i for i, cell in enumerate(body)}
-        self.static = (
-            board.opponent_blocked | board.wall_cells | board.bomb_zone
-        )
+        zone = board.bomb_zone if bomb_zone is None else bomb_zone
+        self.static = board.opponent_blocked | board.wall_cells | zone
         self.start = body[0]
         self.visited = {self.start}
         self.budget = PATH_SEARCH_BUDGET
@@ -232,6 +231,7 @@ class SnakeStrategy:
         """Prueba cada plan en orden de prioridad; si ninguno aplica, busca
         territorio."""
         for plan in (
+            self._cheap_bomb_step,
             self._star_step,
             self._tail_step,
             self._target_step,
@@ -245,6 +245,26 @@ class SnakeStrategy:
         aggressive = self._is_aggressive(turn.my_score, turn.opp_score)
         return self._best_territory_move(
             turn.board, turn.candidates, aggressive
+        )
+
+    @staticmethod
+    def _cheap_bomb_step(turn):
+        """Si todo paso sin bomba cuesta, explotar puede ser lo mas barato
+        (por ejemplo con poco puntaje frente a un digito equivocado)."""
+        cands = list(turn.candidates.values())
+        bomb = SnakeStrategy._cost_of(cands, lambda c: c.get('blast_room'))
+        other = SnakeStrategy._cost_of(cands, lambda c: not c['bomb_hit'])
+        return bomb[1] if bomb[0] < other[0] else None
+
+    @staticmethod
+    def _cost_of(cands, keep):
+        """(penalidad, direccion) del paso mas barato que cumple `keep`; sin
+        pasos, infinito."""
+        kept = filter(keep, cands)
+        best = min(kept, key=lambda c: c['penalty'], default=None)
+        return (float('inf'), None) if best is None else (
+            best['penalty'],
+            best['dir'],
         )
 
     def _star_step(self, turn):
@@ -885,8 +905,18 @@ class SnakeStrategy:
             'path_ok': pos in new_blocked
             or self._has_escape_path(board, pos, grows),
         }
+        if cand['bomb_hit']:
+            self._add_blast_room(board, cand, static_blocked, grows)
         cand['penalty'] = self._penalty(cand, costs)
         return cand
+
+    def _add_blast_room(self, board, cand, static_blocked, grows):
+        """Si exploto, esa bomba desaparece: espacio y salida reales."""
+        zone = board.zone_after_explosion(cand['pos'])
+        room = board.bfs_all_distances(cand['pos'], static_blocked | zone)
+        cand['blast_room'] = len(room) >= cand['body_len'] and (
+            self._has_escape_path(board, cand['pos'], grows, zone)
+        )
 
     def _territory(self, dist_map):
         """Celdas a las que llego antes que el rival."""
@@ -904,7 +934,7 @@ class SnakeStrategy:
         return len(board.bfs_all_distances(board.opponent_head, blocked))
 
     @staticmethod
-    def _has_escape_path(board, pos, grows):
+    def _has_escape_path(board, pos, grows, bomb_zone=None):
         """True si desde `pos` hay un camino tan largo como el cuerpo (o no se
         puede saber)."""
         if board.tail is None:
@@ -912,7 +942,7 @@ class SnakeStrategy:
         body = [pos] + (
             board.ordered_body if grows else board.ordered_body[:-1]
         )
-        return EscapeSearch(board, body).run()
+        return EscapeSearch(board, body, bomb_zone).run()
 
     @staticmethod
     def _penalty(cand, costs):

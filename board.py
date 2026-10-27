@@ -191,12 +191,22 @@ class Board:
     def _add_shed_tail(self, pos, ch):
         self.own_shed_tail.append(pos)
 
-    def _compute_bomb_zone(self):
+    def _compute_bomb_zone(self, bombs=None):
         """Celdas donde terminar con la cabeza hace explotar una bomba."""
         zone = set()
-        for (br, bc), radius in self.bombs:
+        for (br, bc), radius in self.bombs if bombs is None else bombs:
             zone |= self._square(br, bc, radius)
         return zone
+
+    def zone_after_explosion(self, pos):
+        """Zona de bombas que queda si la cabeza explota las que alcanzan
+        `pos`."""
+        left = [
+            (bomb, radius)
+            for bomb, radius in self.bombs
+            if self.chebyshev(pos, bomb) > radius
+        ]
+        return self._compute_bomb_zone(left)
 
     def _square(self, row, col, radius):
         """Cuadrado de lado 2*radio+1 alrededor de (row, col), recortado al

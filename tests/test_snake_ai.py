@@ -1982,3 +1982,45 @@ class SnakeStrategyTest(unittest.TestCase):
     def test_safe_direction_without_head_or_board(self):
         assert safe_direction('|...|', 'A', '1x3') == FALLBACK_DIRECTION
         assert safe_direction(None, 'A') == FALLBACK_DIRECTION
+
+    def test_low_score_prefers_bomb_over_wrong_digit(self):
+        # Partida e32a246e (santinovitale), turno 23: con 11 puntos explotar
+        # cuesta 11 y el digito equivocado 500.
+        rows = [
+            '.........',
+            '....6....',
+            '..' + SMALL + '.A.' + SMALL + '..',
+            '....a....',
+            '....a....',
+            '.........',
+            '1........',
+        ]
+        d = SnakeStrategy().choose_direction(
+            make_board_str(rows),
+            'A',
+            board_size='7x9',
+            my_score=11,
+            opp_score=0,
+            remaining_moves=380,
+        )
+        assert d in ('left', 'right')
+
+    def test_high_score_still_takes_the_wrong_digit(self):
+        rows = [
+            '.........',
+            '....6....',
+            '..' + SMALL + '.A.' + SMALL + '..',
+            '....a....',
+            '....a....',
+            '.........',
+            '1........',
+        ]
+        d = SnakeStrategy().choose_direction(
+            make_board_str(rows),
+            'A',
+            board_size='7x9',
+            my_score=3000,
+            opp_score=0,
+            remaining_moves=380,
+        )
+        assert d == 'up'
