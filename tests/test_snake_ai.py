@@ -863,8 +863,9 @@ class SnakeStrategyTest(unittest.TestCase):
         )
         assert d == 'down'
 
-    def test_early_far_x_beats_small_adjacent_digit(self):
-        # El 2 vale 200; el 'X' lejano, con 100 turnos por delante, ~7000.
+    def test_early_far_x_still_eats_the_adjacent_digit_first(self):
+        # El 'X' lejano vale mas, pero el 2 esta de paso: comerlo antes no
+        # cambia la carrera al 'X' (antes iba directo y lo dejaba).
         grid = make_grid(10, 10)
         grid[2][2] = 'A'
         grid[2][3] = '2'
@@ -881,7 +882,7 @@ class SnakeStrategyTest(unittest.TestCase):
             opp_score=0,
             remaining_moves=200,
         )
-        assert d == 'down'
+        assert d == 'right'
 
     def test_goes_for_pickup_when_closer_than_digit(self):
         grid = make_grid(10, 10)
@@ -2022,5 +2023,37 @@ class SnakeStrategyTest(unittest.TestCase):
             my_score=3000,
             opp_score=0,
             remaining_moves=380,
+        )
+        assert d == 'up'
+
+    def test_near_digit_first_when_the_x_stays_mine(self):
+        # Partidas contra marianobarros-arce y santinovitale: iba a un 'X' a
+        # 15 pasos y dejaba un digito a 4, que se comia el rival.
+        grid = make_grid(12, 12)
+        grid[6][4] = 'a'
+        grid[6][5] = 'a'
+        grid[6][6] = 'A'
+        grid[4][6] = '2'
+        grid[11][11] = 'X'
+        grid[0][2] = 'B'
+        grid[0][3] = 'b'
+        grid[0][9] = '3'
+        grid[11][0] = '4'
+        grid[0][5] = '5'
+        grid[9][1] = '6'
+        board_str = grid_to_str(grid)
+        s = SnakeStrategy()
+        board = Board(board_str, 'A', '12x12')
+        cands = s._build_candidates(board)
+        assert s._x_waits_for_me(board, cands) is True
+        d = s.choose_direction(
+            board_str,
+            'A',
+            board_size='12x12',
+            my_score=0,
+            opp_score=0,
+            remaining_moves=360,
+            my_multiplier=3,
+            opp_multiplier=3,
         )
         assert d == 'up'

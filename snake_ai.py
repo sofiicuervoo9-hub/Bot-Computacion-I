@@ -448,12 +448,35 @@ class SnakeStrategy:
             food_dist,
             turns,
         )
+        x_wins = self._x_beats_digit(
+            board,
+            candidates,
+            (x_value, mult_dist),
+            (digit_value, food_dist),
+        )
+        return mult_step if x_wins else food_step
+
+    def _x_beats_digit(self, board, candidates, x, digit):
+        """Compara (valor, distancia) del 'X' y del digito."""
+        (x_value, mult_dist), (digit_value, food_dist) = x, digit
         if mult_dist <= food_dist:
             # El 'X' esta mas cerca pero el desvio me hace perder el digito.
-            return mult_step if x_value > digit_value else food_step
-        if x_value / max(1, mult_dist) > digit_value / max(1, food_dist):
-            return mult_step
-        return food_step
+            return x_value > digit_value
+        if self._x_waits_for_me(board, candidates):
+            # El digito esta mas cerca y despues sigo llegando primero al 'X'.
+            return False
+        return x_value / max(1, mult_dist) > digit_value / max(1, food_dist)
+
+    def _x_waits_for_me(self, board, candidates):
+        """True si comiendo antes el digito llego a algun 'X' antes que el
+        rival."""
+        return any(
+            self._arrives_first(
+                self._via(board, candidates, board.food, [x]),
+                self._opp_dist.get(x),
+            )
+            for x in board.multiplier_pickups
+        )
 
     def _take_x_first(
         self, board, candidates, x_value, mult_dist, food_dist, turns
